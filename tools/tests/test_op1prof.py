@@ -426,7 +426,8 @@ def _capture(tmp_path, trace_data, marks=()):
     capture = tmp_path / "capture"
     (capture / "run").mkdir(parents=True)
     (capture / "run" / "trace.json").write_text(json.dumps(trace_data))
-    run_entry = {"marks": list(marks), "binary_sha256": "b" * 64, "inputs": {"nand_sha256": "n" * 64}}
+    run_entry = {"marks": list(marks), "binary_sha256": "b" * 64, "inputs": {"nand_sha256": "n" * 64},
+                 "guest_args": [], "script_sha256": "s" * 64}
     (capture / "capture.json").write_text(json.dumps({
         "event": "cpu-clock:u", "precise": False, "rate": ["-F", "999"], "window": ["a", "b"],
         "run": run_entry}))
@@ -438,7 +439,8 @@ def _census_run_entry(census_run, marks, binary="b" * 64, nand="n" * 64):
     """The log and run.json a census run of op1prof writes beside its dumps."""
     (census_run / "log.txt").write_text("\n".join(map(_mark_line, marks)) + "\n")
     (census_run / "run.json").write_text(json.dumps({"marks": list(marks), "binary_sha256": binary,
-                                                     "inputs": {"nand_sha256": nand}}))
+                                                     "inputs": {"nand_sha256": nand}, "guest_args": [],
+                                                     "script_sha256": "s" * 64}))
 
 
 def test_report_withholds_inclusive_tables_for_broken_chains(tmp_path):
@@ -1398,3 +1400,25 @@ def test_service_command(tmp_path, capsys):
     assert "event queue: 1,000 ProcessEvents calls" in capsys.readouterr().out
     assert json.loads(out.read_text())["schema"] == "op1prof.service.v1"
     assert cli.main(["service", str(run_dir), "--phase", "a:missing"]) == 2
+
+
+def test_the_same_run_also_means_the_same_guest_settings(files, tmp_path):
+    # The same work counted under another RTC epoch: the guest read other
+    # RTC values, so the census does not describe the captured run.
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    run(spec(files, args=["--rtc-epoch", "100"]), capture / "run")
+    other = run(spec(files, args=["--rtc-epoch", "200"]), tmp_path / "other")
+    with pytest.raises(ValueError, match="another guest_args"):
+        perf_report.check_same_run(capture, other.directory)
+    # Diagnostic options of the census run are expected and not compared.
+    census_run = run(spec(files, args=["--rtc-epoch", "100", "--profile-probes", "--profile-checksum-every", "9"]),
+                     tmp_path / "census")
+    assert census_run.guest_args == ["--rtc-epoch", "100"]
+    perf_report.check_same_run(capture, census_run.directory)
+    # perf's own options (added by op1prof perf) are diagnostic too.
+    from op1prof.runner import guest_args
+    assert guest_args(["--perf-ctl-fifo", "/x/ctl", "--perf-window", "a:b", "--perf-jitdump"]) == []
+    script = run(spec(files, args=["--rtc-epoch", "100"], script="volume 7\nwait 86400000\n"), tmp_path / "script")
+    with pytest.raises(ValueError, match="another script"):
+        perf_report.check_same_run(capture, script.directory)

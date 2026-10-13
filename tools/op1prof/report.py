@@ -223,6 +223,14 @@ def check_same_run(capture: Path, census_run: Path) -> None:
     for key, value in capture_run.get("inputs", {}).items():
         if census.get("inputs", {}).get(key) != value:
             raise ValueError(f"the census run read another input than the capture: {key}")
+    # Settings the guest sees (an RTC epoch, the input script): equal counts
+    # do not prove equal state.
+    for key in ("guest_args", "script_sha256"):
+        if key not in capture_run or key not in census:
+            raise ValueError(f"a run.json without {key} (recorded by an older op1prof); record the run again")
+        if capture_run[key] != census[key]:
+            raise ValueError(f"the census run had another {key.replace('_sha256', '')} than the capture "
+                             f"({census[key]} vs {capture_run[key]})")
     capture_marks, census_marks = _marks(capture_run["marks"]), _marks(census["marks"])
     diff = workload_diff(capture_marks, census_marks)
     if diff:

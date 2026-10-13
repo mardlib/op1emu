@@ -45,6 +45,27 @@ EXIT_GRACE_S = 60.0
 MAX_LOG_BYTES = 200 << 20
 
 
+# Instrumentation options that take a value: guest_args() drops the value too.
+INSTRUMENT_VALUE_ARGS = ("--profile-census", "--profile-checksum", "--profile-checksum-every",
+                         "--profile-checksum-from", "--profile-dump-ir", "--profile-dump-dir", "--perf-ctl-fifo",
+                         "--perf-window")
+
+
+def guest_args(args: List[str]) -> List[str]:
+    """Extra emulator arguments without the diagnostic ones: what can change
+    the guest (say --rtc-epoch). Two runs that differ here may count the same
+    work and still have seen different state."""
+    out, skip = [], False
+    for arg in args:
+        if skip:
+            skip = False
+        elif arg in INSTRUMENT_VALUE_ARGS:
+            skip = True
+        elif arg not in INSTRUMENT_ARGS:
+            out.append(arg)
+    return out
+
+
 def reserved_args(args: List[str]) -> List[str]:
     return [arg for arg in args if arg in RESERVED_ARGS]
 
@@ -126,6 +147,8 @@ class RunResult:
     cpu: Optional[int] = None
     build: Optional[dict] = None   # the [build] line: what the binary was built from
     binary_sha256: Optional[str] = None
+    guest_args: Optional[List[str]] = None   # extra arguments that can change the guest
+    script_sha256: Optional[str] = None      # the headless input script
     _contention: Optional[dict] = field(default=None, repr=False, compare=False)
 
     @property
@@ -156,7 +179,8 @@ class RunResult:
             "elapsed_s": self.elapsed_s, "reached": self.reached,
             "marks": [{"name": m.name, "pc": m.pc, "wall_ms": m.wall_ms, "cpu_ms": m.cpu_ms,
                        **m.counters} for m in self.marks],
-            "inputs": self.inputs, "binary_sha256": self.binary_sha256, "build": self.build, "machine_before": self.before, "machine_after": self.after,
+            "inputs": self.inputs, "binary_sha256": self.binary_sha256, "guest_args": self.guest_args,
+            "script_sha256": self.script_sha256, "build": self.build, "machine_before": self.before, "machine_after": self.after,
             "contention": self.contention(),
         }
 
@@ -291,7 +315,9 @@ def run(spec: RunSpec, directory: Path) -> RunResult:
     result = RunResult(directory=directory, command=command, returncode=returncode, marks=marks,
                        error=error, elapsed_s=time.monotonic() - start, before=before,
                        after=machine.snapshot(spec.cpu).to_json(), until=spec.until, inputs=inputs,
-                       cpu=machine.measured_cpu(spec.cpu), build=build, binary_sha256=binary_sha256)
+                       cpu=machine.measured_cpu(spec.cpu), build=build, binary_sha256=binary_sha256,
+                       guest_args=guest_args(spec.args),
+                       script_sha256=hashlib.sha256(spec.script.encode()).hexdigest())
     # Beside the run's own files, so a later join can tell which binary and
     # inputs produced them.
     (directory / RUN_FILE).write_text(json.dumps(result.to_json(), indent=1) + "\n")
