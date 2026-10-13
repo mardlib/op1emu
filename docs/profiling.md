@@ -343,7 +343,9 @@ execution is reported only over clean pairs (both runs: wall at most 1.05x
 CPU and at most 1 s off-CPU). The gate compares `irq` and `irq_latched`
 only when both sides report them, so a binary older than either can still be
 compared on the rest. `extend` and `verify --expect` refuse files of another
-schema.
+schema. `extend` holds a batch's saved arguments to the same instrumentation
+rule as `ab`, and the summary re-judges every pair's workload from its runs'
+marks, so the pairs an older op1prof ran are gated like the new ones.
 
 With `--counters` (also on `run` and `verify`) every run counts host
 instructions, and `ab` reports **execution instructions** with their own

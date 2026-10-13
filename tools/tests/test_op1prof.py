@@ -1152,3 +1152,36 @@ def test_mmio_first_names_marks_that_did_not_fire(files, tmp_path, capsys):
     assert _cli(files, "run", "--out", str(tmp_path / "r"), "--until", "main-display") == 0
     assert cli.main(["census", str(tmp_path / "r" / "run"), "--phase", "bootrom:main-frame", "--mmio-first"]) == 2
     assert "did not fire" in capsys.readouterr().err
+
+
+def _batch(files, out):
+    """A finished A/A batch of four pairs in `out`, and its saved report."""
+    out.mkdir()
+    ab.compare(_side("base", files, out), _side("new", files, out), spec(files), 4, out,
+               ("start", "main-frame"), 2.0, False)
+    return json.loads((out / "results.json").read_text())
+
+
+def test_extend_holds_saved_settings_to_the_instrumentation_rule(files, tmp_path):
+    # A batch an older op1prof started with one side's probes on.
+    out = tmp_path / "ab"
+    saved = _batch(files, out)
+    saved["config"]["sides"]["new"]["args"] = ["--profile-probes"]
+    (out / "results.json").write_text(json.dumps(saved))
+    with pytest.raises(SystemExit, match="refuses diagnostic instrumentation"):
+        cli.main(["extend", str(out), "--pairs", "2", "--force"])
+    assert len(json.loads((out / "results.json").read_text())["pairs"]) == 4   # nothing ran
+
+
+def test_extend_judges_earlier_pairs_by_the_current_gate(files, tmp_path):
+    # An older op1prof gated on events and recorded these differences.
+    out = tmp_path / "ab"
+    saved = _batch(files, out)
+    for pair in saved["pairs"]:
+        pair["workload_diff"] = ["main-display.events: 6 vs 4 (-33.333%)"]
+    saved["status"] = ab.WORKLOAD_CHANGED
+    (out / "results.json").write_text(json.dumps(saved))
+    cli.main(["extend", str(out), "--pairs", "2", "--force"])
+    report = json.loads((out / "results.json").read_text())
+    assert [p["workload_diff"] for p in report["pairs"]] == [[]] * 6
+    assert report["status"] != ab.WORKLOAD_CHANGED and not report["workload_changed"]

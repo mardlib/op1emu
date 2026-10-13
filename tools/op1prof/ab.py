@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple
 
 from . import compilation, machine, stats, trace
 from .marks import Mark, workload_diff
-from .runner import RunResult, RunSpec, input_hashes, run, sha256_file
+from .runner import RunResult, RunSpec, input_hashes, instrument_args, run, sha256_file
 
 # A wall-time pair is clean when neither run lost real time off-CPU:
 # wall <= 1.05 x CPU and at most 1 s of off-CPU time.
@@ -101,6 +101,12 @@ def compare(base: Side, new: Side, spec: RunSpec, pairs: int, out: Path, phase: 
     report of the same batch), add them to its pairs instead of starting."""
     if pairs < 2 or pairs % 2 or (previous is None and pairs < 4):
         raise ValueError("use an even number of pairs, at least 4 (2 to extend), so AB and BA orders balance")
+    # Here rather than only in the ab command, so that a batch extended from
+    # its saved settings is held to the same rule.
+    instrumented = instrument_args(spec.args + base.args + new.args)
+    if instrumented:
+        raise ValueError(f"ab measures time and refuses diagnostic instrumentation {instrumented}: use run --census, "
+                         "run --probes, run --checksum or perf for those")
     if previous is None:
         report = {"schema": SCHEMA, "phase": list(phase), "min_effect_pct": min_effect_pct,
                   "sides": {s.name: {"binary_sha256": s.sha256, "args": s.args} for s in (base, new)},
@@ -225,6 +231,12 @@ def summarize(report: dict, min_effect_pct: float, allow_workload_change: bool, 
             unstable += [f"{name}: {line}" for line in workload_diff(first, _marks(pair[name]))]
     report["unstable"] = unstable
     report["changed_inputs"] = _changed_inputs(report)
+
+    # Recomputed from the runs' marks every time, so that the pairs of an
+    # extended batch are all judged by this version's gate, whichever
+    # version ran them.
+    for info, pair in zip(report["pairs"], pairs):
+        info["workload_diff"] = workload_diff(_marks(pair["base"]), _marks(pair["new"]))
 
     workload_changed = [p for p in report["pairs"] if p["workload_diff"]]
     report["workload_changed"] = bool(workload_changed)
