@@ -21,6 +21,7 @@ CLEAN_OFFCPU_MS = 1000.0
 DRIFT_P = 0.01
 DRIFT_MIN_RUNS = 6
 SCHEMA = "op1prof.ab.v2"
+WORKLOAD_CHANGED = "workload changed: the two sides did different guest work"
 
 
 @dataclass
@@ -106,7 +107,9 @@ def compare(base: Side, new: Side, spec: RunSpec, pairs: int, out: Path, phase: 
                   "config": _config(base, new, spec, phase, min_effect_pct, allow_workload_change, seed),
                   "runs": [], "pairs": [], "extensions": 0, "status": "running"}
     else:
-        if previous.get("status") not in stats.VERDICTS + ("workload changed: the two sides did different guest work",):
+        if previous.get("schema") != SCHEMA:
+            raise ValueError(f"the batch was written as {previous.get('schema')!r}, not {SCHEMA}: start a new one")
+        if previous.get("status") not in stats.VERDICTS + (WORKLOAD_CHANGED,):
             raise ValueError(f"the batch ended {previous.get('status')!r}: only a finished batch can be extended; "
                              "start a new one")
         report = {**previous, "extensions": previous.get("extensions", 0) + 1, "status": "running"}
@@ -270,6 +273,6 @@ def summarize(report: dict, min_effect_pct: float, allow_workload_change: bool, 
     elif unstable:
         report["status"] = "unusable: a configuration did not repeat its own workload"
     elif workload_changed and not allow_workload_change:
-        report["status"] = "workload changed: the two sides did different guest work"
+        report["status"] = WORKLOAD_CHANGED
     else:
         report["status"] = summary[decided_on]["verdict"]
