@@ -463,9 +463,9 @@ def cmd_service(args) -> int:
         begin, end = marks_file.parse_phase(args.phase)
         data = service.phase(args.run / "census", begin, end)
         if args.capture:
-            info = json.loads((args.capture / "capture.json").read_text())
+            perf_report.check_same_run(args.capture, args.run)
             priced = perf_report.analyze(args.capture, Categories.load(), perf_report.Labels())
-            data = service.join(data, priced, perf_report._marks(info["run"]["marks"]), service.run_marks(args.run))
+            data = service.join(data, priced)
     except (OSError, ValueError, KeyError, RuntimeError) as error:
         print(f"service: {error}", file=sys.stderr)
         return 2

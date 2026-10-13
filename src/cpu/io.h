@@ -43,8 +43,11 @@ public:
 
     virtual void ProcessWithInterrupt(int ivg) {}
 
-    // Data a service call moved (DMA: bytes), for the profiling build's
-    // service census; nothing in a normal build.
+    // What a service call moved or completed (DMA, TWI, USB: bytes; RTC: a
+    // completed register write; NFC: the flash turning ready), for the
+    // profiling build's service census; nothing in a normal build. A device
+    // that reports nothing here can still be doing work the census cannot
+    // see: "productive" is a lower bound.
     void CountServiceWork(uint64_t amount) {
 #ifdef ENABLE_PROFILING
         serviceWork_ += amount;

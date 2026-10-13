@@ -5,9 +5,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List
 
-from .marks import Mark, parse_marks, workload_diff
 
 SCHEMA = "op1.service.v1"
 SOURCE_FIELDS = ("calls", "productive", "published", "transitions", "queued", "raises", "work")
@@ -56,8 +55,10 @@ def phase(prefix: Path, begin: str, end: str) -> dict:
             ivg.append(row)
     queue = {k: _minus(b["queue"][k], a["queue"][k], f"queue {k}", begin, end) for k in QUEUE_FIELDS}
     queue["length_max_so_far"] = b["queue"]["length_max"]
+    other = {k: _minus(b.get("other_threads", {}).get(k, 0), a.get("other_threads", {}).get(k, 0),
+                       f"other threads' {k}", begin, end) for k in ("published", "forwarded")}
     return {"schema": "op1prof.service.v1", "phase": [begin, end], "sources": sources, "pins": pins, "ivg": ivg,
-            "queue": queue,
+            "queue": queue, "other_threads": {**other, "queued": queue["queued_other_threads"]},
             "timer_ticks_dropped": _minus(b["timer_ticks_dropped"], a["timer_ticks_dropped"], "timer ticks",
                                           begin, end),
             "bcore": {k: _minus(b["bcore"][k], a["bcore"][k], k, begin, end) for k in b["bcore"]}}
@@ -67,18 +68,15 @@ def _service_symbol(type_name: str) -> str:
     return f"{type_name}::ProcessWithInterrupt("
 
 
-def join(data: dict, capture_report: dict, capture_marks: List[Mark], run_marks: List[Mark]) -> dict:
+def join(data: dict, capture_report: dict) -> dict:
     """Price each device's service calls with a perf capture of the same
-    work: the inclusive time of its ProcessWithInterrupt over its calls and
-    over its productive calls. The census changes timing, so the prices come
-    from another run, which must have done exactly the same guest work."""
+    run in all but timing (report.check_same_run, which the caller applies):
+    the inclusive time of its ProcessWithInterrupt over its calls and over
+    its productive calls."""
     if tuple(capture_report["window"]) != tuple(data["phase"]):
         raise ValueError(f"the capture's window {capture_report['window']} is not the phase {data['phase']}")
     if not capture_report.get("inclusive_valid"):
         raise ValueError("pricing service calls needs whole call chains: capture with --call-graph lbr")
-    diff = workload_diff(capture_marks, run_marks)
-    if diff:
-        raise ValueError("the census run did different guest work than the capture: " + "; ".join(diff[:5]))
     inclusive = capture_report["host_inclusive"]
     for source in data["sources"]:
         if not source["device"]:
@@ -155,6 +153,11 @@ def report(data: dict, top: int) -> str:
     lines += ["", f"event queue: {calls:,} ProcessEvents calls, {_pct(q['nonempty_calls'], calls).strip()} with "
               f"events, {q['length_sum'] / calls if calls else 0:.3f} events waiting on average, at most "
               f"{q['length_max_so_far']} up to {end}; {q['queued_other_threads']:,} queued by other threads"]
+    o = data.get("other_threads", {})
+    if any(o.values()):
+        lines.append(f"other threads (the USB/IP loop): {o.get('published', 0):,} levels published, "
+                     f"{o.get('forwarded', 0):,} raises forwarded, {o.get('queued', 0):,} events queued; "
+                     "counted, not attributed to any source or pin")
     b = data["bcore"]
     lines.append(f"bcore: {b['blocks_executed']:,} blocks executed, {b['cache_hits']:,} cache hits, "
                  f"{b['cache_misses']:,} misses")
@@ -163,7 +166,3 @@ def report(data: dict, top: int) -> str:
                      "one block): the guest lost timer time")
     lines.append("Counts are work, not cost; --capture prices the device calls.")
     return "\n".join(lines)
-
-
-def run_marks(run: Path) -> List[Mark]:
-    return parse_marks((run / "log.txt").read_text(errors="replace").splitlines())

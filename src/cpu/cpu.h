@@ -131,7 +131,8 @@ protected:
     Profiler* profiler_ = nullptr;
     uint64_t eventsDelivered_ = 0;
     std::array<uint64_t, 16> irqLatched_{};
-    profiling::ServiceStats* service_ = nullptr;
+    std::atomic<profiling::ServiceStats*> service_{nullptr};
+    profiling::ServiceStats* Service() const { return service_.load(std::memory_order_acquire); }
 #endif
     // Last cyclesElapsed value the GP timers were advanced to (see Run()).
     uint64_t lastTimerCycles_ = 0;

@@ -426,10 +426,19 @@ def _capture(tmp_path, trace_data, marks=()):
     capture = tmp_path / "capture"
     (capture / "run").mkdir(parents=True)
     (capture / "run" / "trace.json").write_text(json.dumps(trace_data))
+    run_entry = {"marks": list(marks), "binary_sha256": "b" * 64, "inputs": {"nand_sha256": "n" * 64}}
     (capture / "capture.json").write_text(json.dumps({
         "event": "cpu-clock:u", "precise": False, "rate": ["-F", "999"], "window": ["a", "b"],
-        "run": {"marks": list(marks)}}))
+        "run": run_entry}))
+    (capture / "run" / "run.json").write_text(json.dumps(run_entry))
     return capture
+
+
+def _census_run_entry(census_run, marks, binary="b" * 64, nand="n" * 64):
+    """The log and run.json a census run of op1prof writes beside its dumps."""
+    (census_run / "log.txt").write_text("\n".join(map(_mark_line, marks)) + "\n")
+    (census_run / "run.json").write_text(json.dumps({"marks": list(marks), "binary_sha256": binary,
+                                                     "inputs": {"nand_sha256": nand}}))
 
 
 def test_report_withholds_inclusive_tables_for_broken_chains(tmp_path):
@@ -466,7 +475,7 @@ def test_census_join_prices_block_runs_and_refuses_other_work(tmp_path):
     capture = _capture(tmp_path, _perf_trace(), marks)
     census_run = tmp_path / "census-run"
     census_run.mkdir()
-    (census_run / "log.txt").write_text("\n".join(map(_mark_line, marks)) + "\n")
+    _census_run_entry(census_run, marks)
     _census(census_run / "census.pc.a", [(0x01a5e27e, 1, 4)])
     _census(census_run / "census.pc.b", [(0x01a5e27e, 5, 24), (0x200, 3, 3)])
     _census(census_run / "census.mmio.a", [])
@@ -484,8 +493,22 @@ def test_census_join_prices_block_runs_and_refuses_other_work(tmp_path):
     assert rows["bb_0x00000200"]["seconds"] == 0
     assert data["census"]["outside_blocks_ns_per_run"] == pytest.approx(50 * per_weight * 1e9 / 7)
     assert "ns/run" in perf_report.format_report(data, 10, "ns-per-run")
-    (census_run / "log.txt").write_text("\n".join(map(_mark_line, [marks[0], _mark_entry("b", 21)])) + "\n")
+    _census_run_entry(census_run, [marks[0], _mark_entry("b", 21)])
     with pytest.raises(ValueError, match="different guest work"):
+        perf_report.analyze(capture, Categories.load(), labels, census_run=census_run, samples=samples)
+    # The same work in other blocks: the census divides by its own block
+    # counts, so it must have run the same blocks.
+    _census_run_entry(census_run, [marks[0], {**marks[1], "runs": 2}])
+    with pytest.raises(ValueError, match="another number of blocks"):
+        perf_report.analyze(capture, Categories.load(), labels, census_run=census_run, samples=samples)
+    _census_run_entry(census_run, marks, binary="c" * 64)
+    with pytest.raises(ValueError, match="another binary"):
+        perf_report.analyze(capture, Categories.load(), labels, census_run=census_run, samples=samples)
+    _census_run_entry(census_run, marks, nand="m" * 64)
+    with pytest.raises(ValueError, match="another input"):
+        perf_report.analyze(capture, Categories.load(), labels, census_run=census_run, samples=samples)
+    (census_run / "run.json").unlink()
+    with pytest.raises(ValueError, match="older op1prof"):
         perf_report.analyze(capture, Categories.load(), labels, census_run=census_run, samples=samples)
 
 
@@ -1326,10 +1349,7 @@ def test_service_phase_differences_and_report(tmp_path):
         service.phase(prefix, "a", "zz")
 
 
-def test_service_join_prices_calls_and_refuses_other_work():
-    def mark(packets):
-        return parse_mark(f"[mark] b pc=0x0 wall_ms=0 cpu_ms=0 runs=1 packets={packets} cycles={packets} "
-                          "translated=1 mmio_r=0 mmio_w=0 events=0")
+def test_service_join_prices_calls_and_refuses_other_captures():
     def data():
         return {"phase": ["a", "b"], "sources": [
             {"name": "PORTF", "type": "GPIO", "device": True, "calls": 1000, "productive": 0},
@@ -1337,16 +1357,35 @@ def test_service_join_prices_calls_and_refuses_other_work():
             {"name": "block", "type": "", "device": False, "calls": 0, "productive": 0}]}
     capture = {"window": ["a", "b"], "inclusive_valid": True, "event": "cycles:u",
                "host_inclusive": [{"symbol": "GPIO::ProcessWithInterrupt(int)", "seconds": 0.002}]}
-    joined = service.join(data(), capture, [mark(5)], [mark(5)])
+    joined = service.join(data(), capture)
     portg = joined["sources"][1]
     assert portg["seconds"] == pytest.approx(0.001) and portg["ns_per_call"] == pytest.approx(1000.0)
     assert portg["ns_per_productive"] == pytest.approx(100_000.0) and joined["sources"][0]["ns_per_productive"] is None
-    with pytest.raises(ValueError, match="different guest work"):
-        service.join(data(), capture, [mark(5)], [mark(6)])
     with pytest.raises(ValueError, match="window"):
-        service.join(data(), {**capture, "window": ["a", "c"]}, [mark(5)], [mark(5)])
+        service.join(data(), {**capture, "window": ["a", "c"]})
     with pytest.raises(ValueError, match="lbr"):
-        service.join(data(), {**capture, "inclusive_valid": False}, [mark(5)], [mark(5)])
+        service.join(data(), {**capture, "inclusive_valid": False})
+
+
+def test_service_capture_must_be_the_same_run(tmp_path, capsys):
+    # service --capture applies the census join's check: here the capture
+    # ran half the blocks, so its time per call would be halved.
+    marks = [_mark_entry("a", 10), _mark_entry("b", 20)]
+    capture = _capture(tmp_path, _perf_trace(), [marks[0], {**marks[1], "runs": 2}])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _census_run_entry(run_dir, marks)
+    _service_dump(run_dir / "census.service.a", 1)
+    _service_dump(run_dir / "census.service.b", 2)
+    assert cli.main(["service", str(run_dir), "--phase", "a:b", "--capture", str(capture)]) == 2
+    assert "another number of blocks" in capsys.readouterr().err
+
+
+def test_every_run_records_its_binary_beside_its_files(files, tmp_path):
+    result = run(spec(files), tmp_path / "r")
+    saved = json.loads((tmp_path / "r" / "run.json").read_text())
+    assert saved["binary_sha256"] == sha256_file(FAKE) == result.binary_sha256
+    assert saved["marks"] == result.to_json()["marks"]
 
 
 def test_service_command(tmp_path, capsys):

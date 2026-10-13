@@ -209,7 +209,11 @@ interrupt levels they hold, and drains its event queue. `PREFIX.service.MARK`
   the interrupt `raises` queued; `work`, the data a device moved (DMA: bytes,
   reported through `Device::CountServiceWork`); and `productive` calls,
   those that changed a level, queued an event other than a raise, or moved
-  data.
+  data. Devices report what they move or complete through
+  `Device::CountServiceWork`: DMA, TWI and USB bytes, an RTC register write
+  completing, the NFC's flash turning ready. A device that reports nothing
+  there can still do work the census does not see, so `productive` is a
+  lower bound, not proof that a call was useless.
 - **Pins**: per SIC input, levels published and transitions, and the source
   that published first.
 - **IVG**: per level, the raises the SIC `forwarded` (it forwards every
@@ -217,7 +221,10 @@ interrupt levels they hold, and drains its event queue. `PREFIX.service.MARK`
   delivered to the CEC, the new ILAT bits they `latched`, and the entries
   the guest took.
 - **Queue**: `ProcessEvents` calls, how many found events, the summed and
-  largest queue length, events queued by threads other than the CPU thread.
+  largest queue length.
+- **Other threads**: the USB/IP loop publishes levels and queues events
+  through the USB device. Those are counted apart (`other_threads`) and
+  never attributed to a source or pin, whose state the CPU thread owns.
 - GP timer ticks dropped by the 64-tick catch-up limit (none should be, in
   deterministic mode), and bcore's cache hits, misses and blocks executed.
 
@@ -226,11 +233,12 @@ other runs take the plain loop. On a stock boot, between `main-boot` and
 `main-display` (340,049,495 blocks):
 
 - The RTC publishes its interrupt level after every block, and the level
-  never changes; the NFC publishes after every block too, and its level
-  changes 7,548 times. Of 31 devices, 26 never publish or do anything.
-- Priced by an LBR capture, the RTC's service calls take 25.3 s (74 ns
-  each), the DMA's 16.7 s (49 ns; 42,990 calls moved data) and the NFC's
-  8.2 s (24 ns): about 50 s of 88 s of execution.
+  never changes; one call completed a register write. The NFC publishes
+  after every block too; 15,830 calls changed its level or saw the flash
+  turn ready. Of 31 devices, 25 never publish or do anything.
+- Priced by an LBR capture, the RTC's service calls take 25.6 s (75 ns
+  each), the DMA's 19.0 s (56 ns; 42,990 calls moved data) and the NFC's
+  9.9 s (29 ns): 54.5 s of 91.9 s of execution.
 - The SIC forwarded 602,100 raises for 59,107 new ILAT bits: it forwards
   every pending pin again whenever any level is published, so the RTC's
   unchanging level re-raises the NFC's.
@@ -524,7 +532,7 @@ productive calls and what they published; the pins by levels published and
 the share that changed anything; the interrupt chain per IVG; the event
 queue; and dropped timer ticks. The rest of the devices are named in one
 line. `--capture CAPTURE` prices the calls with a perf capture of the same
-guest work (the join is refused otherwise, as for `report --census`): each
+run in all but timing (the join is refused otherwise, as for `report --census`): each
 device's inclusive time in its class's `ProcessWithInterrupt`, split by
 calls among devices of one class, gives seconds, ns per call and ns per
 productive call. It needs whole call chains (`--call-graph lbr`).
@@ -596,8 +604,11 @@ totals are only valid per block and symbol.
 `run --census` (the census changes timing, so never the same run) and gives
 each guest block its runs, packets, seconds, **ns per run** and ns per packet,
 plus the cost per run of everything outside guest blocks (dispatch, devices,
-event queue, CPU loop). The census run must have done exactly the capture's
-guest work, or the join is refused. `--sort ns-per-run` ranks blocks by how
+event queue, CPU loop). The census run must be the capture's run in all
+but timing, or the join is refused: the same binary and inputs (each run
+directory has a `run.json` with them), the same guest work, and the same
+number of blocks at every mark, since the census's block counts divide the
+samples and the workload gate deliberately ignores them. `--sort ns-per-run` ranks blocks by how
 expensive one execution is rather than by total share. These are sampled
 estimates: their error comes from repeating captures, not from sample counts.
 `--json FILE` writes the whole report for further analysis, and

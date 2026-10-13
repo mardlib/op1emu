@@ -34,6 +34,8 @@ RESERVED_ARGS = ("--", "--nand-rw", "--nand-snapshot", "--headless", "--determin
 INSTRUMENT_ARGS = ("--profile-census", "--profile-checksum", "--profile-checksum-every", "--profile-checksum-from",
                    "--profile-probes", "--profile-dump-ir", "--profile-dump-dir", "--perf-ctl-fifo",
                    "--perf-window", "--perf-jitdump")
+# What run() wrote into each run directory: the run's results entry.
+RUN_FILE = "run.json"
 # The emulator's build identity line (absent from binaries before it).
 BUILD_PREFIX = "[build] "
 # How long an emulator that closed its output may take to exit.
@@ -123,6 +125,8 @@ class RunResult:
     inputs: dict = field(default_factory=dict)
     cpu: Optional[int] = None
     build: Optional[dict] = None   # the [build] line: what the binary was built from
+    binary_sha256: Optional[str] = None
+    _contention: Optional[dict] = field(default=None, repr=False, compare=False)
 
     @property
     def reached(self) -> bool:
@@ -136,10 +140,14 @@ class RunResult:
 
     def contention(self) -> dict:
         """What shared the pinned core during the run: its SMT sibling's
-        load and the core's thermal throttling events."""
-        before, after = self.before.get("throttle_count"), self.after.get("throttle_count")
-        return {"sibling_busy": machine.sibling_busy(self.before, self.after, self.cpu),
+        load and the core's thermal throttling events. Computed once: the
+        readings are fixed when the run ends."""
+        if self._contention is None:
+            before, after = self.before.get("throttle_count"), self.after.get("throttle_count")
+            self._contention = {
+                "sibling_busy": machine.sibling_busy(self.before, self.after, self.cpu),
                 "throttle_events": after - before if before is not None and after is not None else None}
+        return self._contention
 
     def to_json(self) -> dict:
         return {
@@ -148,7 +156,7 @@ class RunResult:
             "elapsed_s": self.elapsed_s, "reached": self.reached,
             "marks": [{"name": m.name, "pc": m.pc, "wall_ms": m.wall_ms, "cpu_ms": m.cpu_ms,
                        **m.counters} for m in self.marks],
-            "inputs": self.inputs, "build": self.build, "machine_before": self.before, "machine_after": self.after,
+            "inputs": self.inputs, "binary_sha256": self.binary_sha256, "build": self.build, "machine_before": self.before, "machine_after": self.after,
             "contention": self.contention(),
         }
 
@@ -205,6 +213,7 @@ def run(spec: RunSpec, directory: Path) -> RunResult:
     command = spec.prefix + command
 
     inputs = input_hashes(spec)
+    binary_sha256 = sha256_file(spec.binary)
     before = machine.snapshot(spec.cpu).to_json()
     marks: List[Mark] = []
     build: Optional[dict] = None
@@ -279,7 +288,11 @@ def run(spec: RunSpec, directory: Path) -> RunResult:
         error = f"exit status {returncode}"
     if error is None and not any(m.name == spec.until for m in marks):
         error = f"mark {spec.until!r} never fired"
-    return RunResult(directory=directory, command=command, returncode=returncode, marks=marks,
-                     error=error, elapsed_s=time.monotonic() - start, before=before,
-                     after=machine.snapshot(spec.cpu).to_json(), until=spec.until, inputs=inputs,
-                     cpu=machine.measured_cpu(spec.cpu), build=build)
+    result = RunResult(directory=directory, command=command, returncode=returncode, marks=marks,
+                       error=error, elapsed_s=time.monotonic() - start, before=before,
+                       after=machine.snapshot(spec.cpu).to_json(), until=spec.until, inputs=inputs,
+                       cpu=machine.measured_cpu(spec.cpu), build=build, binary_sha256=binary_sha256)
+    # Beside the run's own files, so a later join can tell which binary and
+    # inputs produced them.
+    (directory / RUN_FILE).write_text(json.dumps(result.to_json(), indent=1) + "\n")
+    return result

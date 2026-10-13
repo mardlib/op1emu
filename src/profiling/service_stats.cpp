@@ -27,6 +27,12 @@ void ServiceStats::SetDevices(const std::vector<std::pair<std::string, std::stri
 }
 
 void ServiceStats::Published(int pin, int level) {
+    if (!OnCpuThread()) {
+        // The pin's last level is the CPU thread's: a transition another
+        // thread made shows up at the CPU thread's next publication.
+        publishedOtherThreads.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     if (pin < 0 || pin >= static_cast<int>(pins.size())) return;
     auto& p = pins[pin];
     auto& source = sources[current];
@@ -41,8 +47,20 @@ void ServiceStats::Published(int pin, int level) {
     }
 }
 
+void ServiceStats::Forwarded(int ivg) {
+    if (!OnCpuThread()) {
+        forwardedOtherThreads.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (ivg >= 0 && ivg < static_cast<int>(forwarded.size())) ++forwarded[ivg];
+}
+
+void ServiceStats::SetRaising(bool value) {
+    if (OnCpuThread()) raising = value;
+}
+
 void ServiceStats::Queued() {
-    if (std::this_thread::get_id() != cpuThread) {
+    if (!OnCpuThread()) {
         queuedOtherThreads.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -96,10 +114,13 @@ bool ServiceStats::Write(const std::string& path, const std::array<uint64_t, 16>
                      core.interrupts_entered[level]);
     std::fprintf(file, "],\"queue\":{\"process_calls\":%" PRIu64 ",\"nonempty_calls\":%" PRIu64
                        ",\"length_sum\":%" PRIu64 ",\"length_max\":%" PRIu64 ",\"queued_other_threads\":%" PRIu64
+                       "},\"other_threads\":{\"published\":%" PRIu64 ",\"forwarded\":%" PRIu64
                        "},\"timer_ticks_dropped\":%" PRIu64 ",\"bcore\":{\"cache_hits\":%" PRIu64
                        ",\"cache_misses\":%" PRIu64 ",\"blocks_executed\":%" PRIu64 "}}\n",
                  processCalls, nonEmptyCalls, lengthSum, lengthMax,
-                 queuedOtherThreads.load(std::memory_order_relaxed), timerTicksDropped, core.cache_hits,
+                 queuedOtherThreads.load(std::memory_order_relaxed),
+                 publishedOtherThreads.load(std::memory_order_relaxed),
+                 forwardedOtherThreads.load(std::memory_order_relaxed), timerTicksDropped, core.cache_hits,
                  core.cache_misses, core.blocks_executed);
     return std::fclose(file) == 0;
 }

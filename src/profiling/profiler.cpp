@@ -432,7 +432,7 @@ struct Profiler::Impl : BcoreEventSink {
     void Start(uint32_t pc) {
         started = true;
         cpuTid = static_cast<long>(gettid());
-        service.cpuThread = std::this_thread::get_id();
+        service.cpuThread.store(std::this_thread::get_id(), std::memory_order_relaxed);
         if (options.counters) {
             std::string error;
             if (!hw.Open(error) || !hw.Read(startHw)) {
