@@ -608,7 +608,9 @@ event queue, CPU loop). The census run must be the capture's run in all
 but timing, or the join is refused: the same binary and inputs (each run
 directory has a `run.json` with them), the same extra emulator arguments
 apart from diagnostic ones (an `--rtc-epoch` changes what the guest reads
-without changing what it counts) and the same input script, the same
+without changing what it counts; an argument naming a file, such as an LDR,
+is compared by the file's SHA-256, taken before the run) and the same input
+script, the same
 guest work, and the same
 number of blocks at every mark, since the census's block counts divide the
 samples and the workload gate deliberately ignores them. `--sort ns-per-run` ranks blocks by how

@@ -51,10 +51,12 @@ INSTRUMENT_VALUE_ARGS = ("--profile-census", "--profile-checksum", "--profile-ch
                          "--perf-window")
 
 
-def guest_args(args: List[str]) -> List[str]:
+def guest_args(args: List[str], cwd: Optional[Path] = None) -> List[str]:
     """Extra emulator arguments without the diagnostic ones: what can change
-    the guest (say --rtc-epoch). Two runs that differ here may count the same
-    work and still have seen different state."""
+    the guest (say --rtc-epoch, or an LDR file). Two runs that differ here
+    may count the same work and still have seen different state. An argument
+    naming a file (resolved from `cwd`, where the emulator runs) carries the
+    file's SHA-256: the same path can hold another LDR."""
     out, skip = [], False
     for arg in args:
         if skip:
@@ -62,7 +64,8 @@ def guest_args(args: List[str]) -> List[str]:
         elif arg in INSTRUMENT_VALUE_ARGS:
             skip = True
         elif arg not in INSTRUMENT_ARGS:
-            out.append(arg)
+            path = Path(arg) if cwd is None or Path(arg).is_absolute() else cwd / arg
+            out.append(f"{arg} sha256:{sha256_file(path)}" if not arg.startswith("-") and path.is_file() else arg)
     return out
 
 
@@ -237,6 +240,7 @@ def run(spec: RunSpec, directory: Path) -> RunResult:
     command = spec.prefix + command
 
     inputs = input_hashes(spec)
+    guest = guest_args(spec.args, directory)  # before the run, like the inputs
     binary_sha256 = sha256_file(spec.binary)
     before = machine.snapshot(spec.cpu).to_json()
     marks: List[Mark] = []
@@ -316,7 +320,7 @@ def run(spec: RunSpec, directory: Path) -> RunResult:
                        error=error, elapsed_s=time.monotonic() - start, before=before,
                        after=machine.snapshot(spec.cpu).to_json(), until=spec.until, inputs=inputs,
                        cpu=machine.measured_cpu(spec.cpu), build=build, binary_sha256=binary_sha256,
-                       guest_args=guest_args(spec.args),
+                       guest_args=guest,
                        script_sha256=hashlib.sha256(spec.script.encode()).hexdigest())
     # Beside the run's own files, so a later join can tell which binary and
     # inputs produced them.

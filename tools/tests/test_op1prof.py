@@ -1422,3 +1422,19 @@ def test_the_same_run_also_means_the_same_guest_settings(files, tmp_path):
     script = run(spec(files, args=["--rtc-epoch", "100"], script="volume 7\nwait 86400000\n"), tmp_path / "script")
     with pytest.raises(ValueError, match="another script"):
         perf_report.check_same_run(capture, script.directory)
+
+
+def test_a_file_argument_is_compared_by_content(files, tmp_path):
+    # The same LDR path, rebuilt between the capture and the census.
+    ldr = tmp_path / "tiny.ldr"
+    ldr.write_bytes(b"first")
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    first = run(spec(files, args=[str(ldr)]), capture / "run")
+    assert first.guest_args == [f"{ldr} sha256:{sha256_file(ldr)}"]
+    same = run(spec(files, args=[str(ldr)]), tmp_path / "same")
+    perf_report.check_same_run(capture, same.directory)
+    ldr.write_bytes(b"second")
+    rebuilt = run(spec(files, args=[str(ldr)]), tmp_path / "rebuilt")
+    with pytest.raises(ValueError, match="another guest_args"):
+        perf_report.check_same_run(capture, rebuilt.directory)
