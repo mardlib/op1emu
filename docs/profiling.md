@@ -158,11 +158,13 @@ microseconds, the clock `perf record -k mono` uses.
   `object_hash`, a hex string hashing that code before relocation together
   with its relocations and, transitively, the constant pools, jump tables
   and function-pointer tables they point into with their own relocations.
-  `terminator` names what ends the block (bcore's
+  `terminator` names where decoding ended the block (bcore's
   `BcoreCompileMetrics::terminator`): `jump`, `call`, `return`,
   `return-from-event`, `jump-indirect`, `call-indirect`, `loop-setup`,
   `raise`, `exception`, `halt`, `illegal`, `unimplemented`, or `packet-cap`
-  when it ends at the packet limit. A conditional branch never ends a block. The same code has the same hash in every process, wherever the JIT
+  at the 256-packet block limit. A conditional branch never ends a block.
+  It is a static label of the block, not of each run: a run can leave
+  earlier, through a taken branch, a hardware loop or an exception. The same code has the same hash in every process, wherever the JIT
   placed it (bcore's fastmem and rawmem paths would embed a host address and
   break that; op1emu uses neither). `collect_ns` is the time spent collecting
   these metrics, included in the span's `cpu_ns`: about 0.09% of compile
@@ -564,7 +566,9 @@ is not.
 
 `census --exits` splits a phase's block runs by why the host was needed
 after them (an MMR, host work the guest could see, both, or neither),
-groups them by what ends the block (from the trace's `terminator`), and
+groups them by where decoding ended the block (the trace's `terminator`, a
+static label: runs that left earlier, through a taken branch or a hardware
+loop, count under it too), and
 lists the blocks with the most runs that needed nothing, with their most
 common successor: the candidates for running more than one block per host
 call. A run the census saw no reason for still has to find its successor,

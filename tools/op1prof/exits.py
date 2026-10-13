@@ -85,7 +85,9 @@ def exits_report(data: dict, edges: Dict[Tuple[int, int], int], limit: int, symb
              f"  needed for host work the guest could see:      {total['host']:>13,} {_pct(total['host'], runs)}",
              f"  needed for both:                               {total['both']:>13,} {_pct(total['both'], runs)}",
              f"  not needed (no MMR, nothing the guest saw):    {total['free']:>13,} {_pct(total['free'], runs)}",
-             "", f"{'block ends in':18s} {'blocks':>7} {'runs':>13} {'not needed':>13} {'share':>6}"]
+             "", "by where decoding ended the block (a static label: a run can leave earlier, through a taken "
+             "branch, a hardware loop or an exception)",
+             f"{'block ends in':18s} {'blocks':>7} {'runs':>13} {'not needed':>13} {'share':>6}"]
     by_kind: Dict[str, list] = defaultdict(lambda: [0, 0, 0])
     for b in blocks:
         row = by_kind[b["terminator"]]
