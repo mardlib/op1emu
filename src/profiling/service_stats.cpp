@@ -7,12 +7,13 @@
 
 namespace profiling {
 
-void ServiceStats::SetDevices(const std::vector<std::pair<std::string, std::string>>& devices) {
+void ServiceStats::SetDevices(const std::vector<DeviceInfo>& devices) {
     sources.clear();
-    for (const auto& [name, type] : devices) {
+    for (const auto& device : devices) {
         Source source;
-        source.name = name;
-        source.type = type;
+        source.name = device.name;
+        source.type = device.type;
+        source.bases = device.bases;
         sources.push_back(source);
     }
     for (const char* name : {"block", "events", "other"}) {
@@ -89,6 +90,12 @@ bool ServiceStats::Write(const std::string& path, const std::array<uint64_t, 16>
         WriteString(file, s.name);
         std::fputs(",\"type\":", file);
         WriteString(file, s.type);
+        std::fputs(",\"bases\":[", file);
+        for (size_t b = 0; b < s.bases.size(); ++b) {
+            if (b) std::fputc(',', file);
+            WriteString(file, s.bases[b]);
+        }
+        std::fputc(']', file);
         std::fprintf(file, ",\"device\":%s,\"calls\":%" PRIu64 ",\"productive\":%" PRIu64 ",\"published\":%" PRIu64
                            ",\"transitions\":%" PRIu64 ",\"queued\":%" PRIu64 ",\"raises\":%" PRIu64
                            ",\"work\":%" PRIu64 "}",

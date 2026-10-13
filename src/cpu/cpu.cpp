@@ -510,20 +510,45 @@ void BlackFinCpu::QueueRaise(int ivg) {
 }
 
 #ifdef ENABLE_PROFILING
-void BlackFinCpu::SetServiceStats(profiling::ServiceStats* stats) {
-    if (stats) {
-        std::vector<std::pair<std::string, std::string>> names;
-        for (const auto& device : devices) {
-            const auto& value = *device;
-            int status = 0;
-            char* type = abi::__cxa_demangle(typeid(value).name(), nullptr, nullptr, &status);
-            names.emplace_back(device->Name(), status == 0 && type ? type : typeid(value).name());
-            std::free(type);
+static std::string Demangled(const std::type_info& type) {
+    int status = 0;
+    char* name = abi::__cxa_demangle(type.name(), nullptr, nullptr, &status);
+    std::string out = status == 0 && name ? name : type.name();
+    std::free(name);
+    return out;
+}
+
+// Base classes depth first, nearest first: the order a lookup of an inherited
+// member searches them in when only one base declares it.
+static void AddBases(const std::type_info& type, std::vector<std::string>& out) {
+    if (auto* single = dynamic_cast<const abi::__si_class_type_info*>(&type)) {
+        out.push_back(Demangled(*single->__base_type));
+        AddBases(*single->__base_type, out);
+    } else if (auto* multiple = dynamic_cast<const abi::__vmi_class_type_info*>(&type)) {
+        for (unsigned i = 0; i < multiple->__base_count; ++i) {
+            const auto& base = *multiple->__base_info[i].__base_type;
+            out.push_back(Demangled(base));
+            AddBases(base, out);
         }
-        stats->SetDevices(names);
     }
+}
+
+profiling::ServiceStats& BlackFinCpu::EnableServiceStats() {
+    if (serviceStats_) return *serviceStats_;
+    std::vector<profiling::ServiceStats::DeviceInfo> infos;
+    for (const auto& device : devices) {
+        const auto& value = *device;
+        profiling::ServiceStats::DeviceInfo info{device->Name(), Demangled(typeid(value)), {}};
+        // The base classes, so a report can find the ProcessWithInterrupt a
+        // device inherits (GPIO, SPORT and most others run Device's).
+        AddBases(typeid(value), info.bases);
+        infos.push_back(std::move(info));
+    }
+    serviceStats_ = std::make_unique<profiling::ServiceStats>();
+    serviceStats_->SetDevices(infos);
     // Published last: the USB/IP thread reads it.
-    service_.store(stats, std::memory_order_release);
+    service_.store(serviceStats_.get(), std::memory_order_release);
+    return *serviceStats_;
 }
 
 // The device loop of Run() with each call counted, and counted as productive

@@ -201,7 +201,7 @@ After every block the CPU loop services every device, re-publishes the
 interrupt levels they hold, and drains its event queue. `PREFIX.service.MARK`
 (JSON, `op1.service.v1`, cumulative) counts that work:
 
-- **Sources**: each device in service order (its name and C++ class), then
+- **Sources**: each device in service order (its name, C++ class and base classes), then
   `block` (MMR accesses while a block runs), `events` (queue callbacks) and
   `other` (the rest of the loop). Per source: service `calls` (devices
   only); `published` interrupt levels and the `transitions` among them (a
@@ -224,7 +224,9 @@ interrupt levels they hold, and drains its event queue. `PREFIX.service.MARK`
   largest queue length.
 - **Other threads**: the USB/IP loop publishes levels and queues events
   through the USB device. Those are counted apart (`other_threads`) and
-  never attributed to a source or pin, whose state the CPU thread owns.
+  never attributed to a source or pin, whose state the CPU thread owns. The
+  CPU owns the counts and frees them with itself, never earlier: that
+  thread can publish at any moment, through the same CPU.
 - GP timer ticks dropped by the 64-tick catch-up limit (none should be, in
   deterministic mode), and bcore's cache hits, misses and blocks executed.
 
@@ -236,9 +238,10 @@ other runs take the plain loop. On a stock boot, between `main-boot` and
   never changes; one call completed a register write. The NFC publishes
   after every block too; 15,830 calls changed its level or saw the flash
   turn ready. Of 31 devices, 25 never publish or do anything.
-- Priced by an LBR capture, the RTC's service calls take 25.6 s (75 ns
-  each), the DMA's 19.0 s (56 ns; 42,990 calls moved data) and the NFC's
-  9.9 s (29 ns): 54.5 s of 91.9 s of execution.
+- Priced by an LBR capture, the RTC's service calls take 24.9 s (73 ns
+  each), the DMA's 16.6 s (49 ns; 42,990 calls moved data) and the NFC's
+  8.3 s (25 ns): 49.8 s of 87.2 s of execution. The 25 devices that run
+  `Device`'s empty method add 2.6 s between them, the cost of calling it.
 - The SIC forwarded 602,100 raises for 59,107 new ILAT bits: it forwards
   every pending pin again whenever any level is published, so the RTC's
   unchanging level re-raises the NFC's.
@@ -533,9 +536,13 @@ the share that changed anything; the interrupt chain per IVG; the event
 queue; and dropped timer ticks. The rest of the devices are named in one
 line. `--capture CAPTURE` prices the calls with a perf capture of the same
 run in all but timing (the join is refused otherwise, as for `report --census`): each
-device's inclusive time in its class's `ProcessWithInterrupt`, split by
-calls among devices of one class, gives seconds, ns per call and ns per
-productive call. It needs whole call chains (`--call-graph lbr`).
+device's price is the inclusive time of the `ProcessWithInterrupt` it runs,
+split by calls among the devices that run the same one, as seconds, ns per
+call and ns per productive call. Most devices inherit `Device`'s empty
+method rather than define their own: the census records each device's base
+classes, and the capture binary's symbol table says which classes define
+the method, so a device is priced by the first of its class and bases that
+does. One whose method cannot be found is shown as `?`, never as a zero. It needs whole call chains (`--call-graph lbr`).
 `--json FILE` writes the report.
 
 `run` and `verify` take `--checksum N` (records every N blocks) and

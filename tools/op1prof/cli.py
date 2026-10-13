@@ -465,7 +465,9 @@ def cmd_service(args) -> int:
         if args.capture:
             perf_report.check_same_run(args.capture, args.run)
             priced = perf_report.analyze(args.capture, Categories.load(), perf_report.Labels())
-            data = service.join(data, priced)
+            # The capture's own binary snapshot: which classes define the method.
+            binary = Path(json.loads((args.capture / "run" / "run.json").read_text())["binary"])
+            data = service.join(data, priced, service.implementing_classes(binary))
     except (OSError, ValueError, KeyError, RuntimeError) as error:
         print(f"service: {error}", file=sys.stderr)
         return 2

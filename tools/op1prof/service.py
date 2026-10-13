@@ -4,8 +4,9 @@ interrupt chain from a device's level to the CEC, and the CPU event queue."""
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
-from typing import List
+from typing import Iterable, List, Optional, Set
 
 
 SCHEMA = "op1.service.v1"
@@ -38,7 +39,8 @@ def phase(prefix: Path, begin: str, end: str) -> dict:
         raise ValueError("the two dumps list different devices")
     sources = []
     for before, after in zip(a["sources"], b["sources"]):
-        sources.append({"name": after["name"], "type": after["type"], "device": after["device"],
+        sources.append({"name": after["name"], "type": after["type"], "bases": after.get("bases", []),
+                        "device": after["device"],
                         **{k: _minus(after[k], before[k], after["name"], begin, end) for k in SOURCE_FIELDS}})
     pins_a = {p["pin"]: p for p in a["pins"]}
     pins = []
@@ -64,27 +66,59 @@ def phase(prefix: Path, begin: str, end: str) -> dict:
             "bcore": {k: _minus(b["bcore"][k], a["bcore"][k], k, begin, end) for k in b["bcore"]}}
 
 
-def _service_symbol(type_name: str) -> str:
-    return f"{type_name}::ProcessWithInterrupt("
+METHOD = "ProcessWithInterrupt"
 
 
-def join(data: dict, capture_report: dict) -> dict:
+def implementing_classes(binary: Path) -> Set[str]:
+    """Classes whose ProcessWithInterrupt the binary defines (from its symbol
+    table): a device runs the first of its class and bases that does."""
+    listing = subprocess.run(["nm", "-C", "--defined-only", str(binary)], capture_output=True, text=True)
+    if listing.returncode != 0:
+        raise RuntimeError(f"nm {binary} failed: {listing.stderr.strip()[-300:]}")
+    return parse_implementing(listing.stdout.splitlines())
+
+
+def parse_implementing(lines: Iterable[str]) -> Set[str]:
+    out = set()
+    for line in lines:
+        name = line.split(" ", 2)[-1]
+        if name.endswith(f"::{METHOD}(int)"):
+            out.add(name[:-len(f"::{METHOD}(int)")])
+    return out
+
+
+def implementation(source: dict, implemented: Set[str]) -> Optional[str]:
+    for name in [source["type"], *source.get("bases", [])]:
+        if name in implemented:
+            return name
+    return None
+
+
+def join(data: dict, capture_report: dict, implemented: Set[str]) -> dict:
     """Price each device's service calls with a perf capture of the same
     run in all but timing (report.check_same_run, which the caller applies):
-    the inclusive time of its ProcessWithInterrupt over its calls and over
-    its productive calls."""
+    the inclusive time of the ProcessWithInterrupt it runs (its own or the
+    one it inherits, from `implemented`) over its calls and its productive
+    calls. Devices that run one method share its time by calls; a device
+    whose method cannot be found gets no price, not a zero."""
     if tuple(capture_report["window"]) != tuple(data["phase"]):
         raise ValueError(f"the capture's window {capture_report['window']} is not the phase {data['phase']}")
     if not capture_report.get("inclusive_valid"):
         raise ValueError("pricing service calls needs whole call chains: capture with --call-graph lbr")
     inclusive = capture_report["host_inclusive"]
     for source in data["sources"]:
+        if source["device"]:
+            source["implementation"] = implementation(source, implemented)
+    for source in data["sources"]:
         if not source["device"]:
             continue
-        prefix = _service_symbol(source["type"])
+        impl = source["implementation"]
+        if impl is None:
+            source["seconds"] = source["ns_per_call"] = source["ns_per_productive"] = None
+            continue
+        prefix = f"{impl}::{METHOD}("
         seconds = sum(row["seconds"] for row in inclusive if row["symbol"].startswith(prefix))
-        # Devices of one class share a symbol: split by calls.
-        same = [s for s in data["sources"] if s["device"] and s["type"] == source["type"]]
+        same = [s for s in data["sources"] if s["device"] and s.get("implementation") == impl]
         calls = sum(s["calls"] for s in same)
         share = seconds * source["calls"] / calls if calls else 0.0
         source["seconds"] = share
@@ -109,7 +143,10 @@ def report(data: dict, top: int) -> str:
     called = [s for s in data["sources"] if s["device"] and s["calls"]]
     # Devices that never published a level nor did anything are summarized,
     # unless a capture gave them time.
-    quiet = [s for s in called if not s["published"] and not s["productive"] and not s.get("seconds")]
+    # With a capture, those running an inherited method are priced in the
+    # shared line below rather than one row each.
+    quiet = [s for s in called if not s["published"] and not s["productive"]
+             and (not priced or (s.get("implementation") not in (None, s["type"])))]
     devices = sorted((s for s in called if s not in quiet),
                      key=lambda s: -(s.get("seconds") or 0) if priced else -s["published"])
     lines = [f"service {begin} -> {end}: devices serviced after every block; a call is productive when it "
@@ -120,14 +157,26 @@ def report(data: dict, top: int) -> str:
         row = (f"{s['name'][:18]:18s} {s['type'][:14]:14s} {s['calls']:>12,} {s['productive']:>10,}"
                f" {_pct(s['productive'], s['calls']):>8}"
                f" {s['published']:>12,} {s['transitions']:>11,} {s['raises']:>10,} {s['work']:>12,}")
-        if priced:
+        if priced and s.get("seconds") is None:
+            row += f" {'?':>8} {'?':>8} {'?':>10}  (no {METHOD} found for {s['type']})"
+        elif priced:
             npc, npp = s.get("ns_per_call"), s.get("ns_per_productive")
             row += (f" {s['seconds']:8.3f} {npc if npc is not None else 0:8.1f}"
                     f" {f'{npp:,.0f}' if npp is not None else '-':>10}")
+            if s.get("implementation") != s["type"]:
+                row += f"  ({s['implementation']}'s, shared)"
         lines.append(row)
     if quiet:
         lines.append(f"and {len(quiet)} devices called {max(q['calls'] for q in quiet):,} times or fewer that never "
                      "did anything: " + ", ".join(q["name"] for q in quiet))
+    if priced:
+        shared = {}
+        for s in called:
+            if s.get("implementation") and s["implementation"] != s["type"]:
+                shared.setdefault(s["implementation"], []).append(s)
+        for impl, members in shared.items():
+            seconds = sum(m["seconds"] for m in members)
+            lines.append(f"{len(members)} devices run {impl}::{METHOD}: {seconds:.3f} s together, split by calls")
     others = [s for s in data["sources"] if not s["device"] and (s["published"] or s["queued"] or s["raises"])]
     if others:
         lines += ["", f"{'outside the device loop':33s} {'published':>12} {'transitions':>11} {'queued':>10}"

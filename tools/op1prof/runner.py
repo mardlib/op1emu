@@ -150,6 +150,7 @@ class RunResult:
     cpu: Optional[int] = None
     build: Optional[dict] = None   # the [build] line: what the binary was built from
     binary_sha256: Optional[str] = None
+    binary: Optional[str] = None             # the snapshot that ran
     guest_args: Optional[List[str]] = None   # extra arguments that can change the guest
     script_sha256: Optional[str] = None      # the headless input script
     _contention: Optional[dict] = field(default=None, repr=False, compare=False)
@@ -182,7 +183,7 @@ class RunResult:
             "elapsed_s": self.elapsed_s, "reached": self.reached,
             "marks": [{"name": m.name, "pc": m.pc, "wall_ms": m.wall_ms, "cpu_ms": m.cpu_ms,
                        **m.counters} for m in self.marks],
-            "inputs": self.inputs, "binary_sha256": self.binary_sha256, "guest_args": self.guest_args,
+            "inputs": self.inputs, "binary": self.binary, "binary_sha256": self.binary_sha256, "guest_args": self.guest_args,
             "script_sha256": self.script_sha256, "build": self.build, "machine_before": self.before, "machine_after": self.after,
             "contention": self.contention(),
         }
@@ -319,7 +320,8 @@ def run(spec: RunSpec, directory: Path) -> RunResult:
     result = RunResult(directory=directory, command=command, returncode=returncode, marks=marks,
                        error=error, elapsed_s=time.monotonic() - start, before=before,
                        after=machine.snapshot(spec.cpu).to_json(), until=spec.until, inputs=inputs,
-                       cpu=machine.measured_cpu(spec.cpu), build=build, binary_sha256=binary_sha256,
+                       cpu=machine.measured_cpu(spec.cpu), build=build, binary=str(spec.binary),
+                       binary_sha256=binary_sha256,
                        guest_args=guest,
                        script_sha256=hashlib.sha256(spec.script.encode()).hexdigest())
     # Beside the run's own files, so a later join can tell which binary and

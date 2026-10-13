@@ -1359,14 +1359,14 @@ def test_service_join_prices_calls_and_refuses_other_captures():
             {"name": "block", "type": "", "device": False, "calls": 0, "productive": 0}]}
     capture = {"window": ["a", "b"], "inclusive_valid": True, "event": "cycles:u",
                "host_inclusive": [{"symbol": "GPIO::ProcessWithInterrupt(int)", "seconds": 0.002}]}
-    joined = service.join(data(), capture)
+    joined = service.join(data(), capture, {"GPIO"})
     portg = joined["sources"][1]
     assert portg["seconds"] == pytest.approx(0.001) and portg["ns_per_call"] == pytest.approx(1000.0)
     assert portg["ns_per_productive"] == pytest.approx(100_000.0) and joined["sources"][0]["ns_per_productive"] is None
     with pytest.raises(ValueError, match="window"):
-        service.join(data(), {**capture, "window": ["a", "c"]})
+        service.join(data(), {**capture, "window": ["a", "c"]}, {"GPIO"})
     with pytest.raises(ValueError, match="lbr"):
-        service.join(data(), {**capture, "inclusive_valid": False})
+        service.join(data(), {**capture, "inclusive_valid": False}, {"GPIO"})
 
 
 def test_service_capture_must_be_the_same_run(tmp_path, capsys):
@@ -1438,3 +1438,35 @@ def test_a_file_argument_is_compared_by_content(files, tmp_path):
     rebuilt = run(spec(files, args=[str(ldr)]), tmp_path / "rebuilt")
     with pytest.raises(ValueError, match="another guest_args"):
         perf_report.check_same_run(capture, rebuilt.directory)
+
+
+def test_devices_that_inherit_their_service_method_share_its_time():
+    # As in op1emu: GPIO and SPORT run Device::ProcessWithInterrupt (a weak
+    # symbol), RTC its own; a class without the method anywhere is unpriced.
+    implemented = service.parse_implementing([
+        "00000000003e0df0 W Device::ProcessWithInterrupt(int)",
+        "0000000000414970 T RTC::ProcessWithInterrupt(int)",
+        "0000000000414000 T RTC::UpdateInterrupts()"])
+    assert implemented == {"Device", "RTC"}
+    def source(name, type_, bases, calls):
+        return {"name": name, "type": type_, "bases": bases, "device": True, "calls": calls, "productive": 0,
+                "published": 1, "transitions": 0, "queued": 0, "raises": 0, "work": 0}
+    data = {"phase": ["a", "b"], "sources": [
+        source("PORTF", "GPIO", ["RegisterDevice", "Device", "GPIOPeripheral"], 1000),
+        source("SPORT0", "SPORT", ["RegisterDevice", "Device", "DMABus"], 3000),
+        source("RTC", "RTC", ["RegisterDevice", "Device"], 1000),
+        source("Odd", "Odd", [], 1000)], "pins": [], "ivg": [],
+        "queue": {"process_calls": 1, "nonempty_calls": 0, "length_sum": 0, "length_max_so_far": 0,
+                  "queued_other_threads": 0}, "timer_ticks_dropped": 0,
+        "bcore": {"blocks_executed": 1, "cache_hits": 1, "cache_misses": 0}}
+    capture = {"window": ["a", "b"], "inclusive_valid": True, "event": "cycles:u", "host_inclusive": [
+        {"symbol": "Device::ProcessWithInterrupt(int)", "seconds": 0.020},
+        {"symbol": "RTC::ProcessWithInterrupt(int)", "seconds": 0.005}]}
+    joined = {s["name"]: s for s in service.join(data, capture, implemented)["sources"]}
+    assert joined["PORTF"]["implementation"] == "Device" and joined["PORTF"]["seconds"] == pytest.approx(0.005)
+    assert joined["SPORT0"]["seconds"] == pytest.approx(0.015) and joined["SPORT0"]["ns_per_call"] == pytest.approx(5000)
+    assert joined["RTC"]["seconds"] == pytest.approx(0.005)
+    assert joined["Odd"]["seconds"] is None                 # no price, never a zero
+    text = service.report(service.join(data, capture, implemented), 10)
+    assert "(Device's, shared)" in text and "2 devices run Device::ProcessWithInterrupt: 0.020 s together" in text
+    assert "(no ProcessWithInterrupt found for Odd)" in text

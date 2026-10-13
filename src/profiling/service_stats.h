@@ -26,6 +26,7 @@ namespace profiling {
 struct ServiceStats {
     struct Source {
         std::string name, type;  // device name and C++ class ("" for the non-device sources)
+        std::vector<std::string> bases;  // the class's base classes, nearest first (single inheritance)
         uint64_t calls = 0;      // service calls (devices only)
         uint64_t productive = 0; // calls that changed a level, queued an event or moved data
         uint64_t published = 0;  // interrupt levels published to the SIC
@@ -55,8 +56,12 @@ struct ServiceStats {
     std::atomic<std::thread::id> cpuThread{};
     uint64_t timerTicksDropped = 0;
 
+    struct DeviceInfo {
+        std::string name, type;
+        std::vector<std::string> bases;
+    };
     // Devices first, in service order; then the three other sources.
-    void SetDevices(const std::vector<std::pair<std::string, std::string>>& devices);
+    void SetDevices(const std::vector<DeviceInfo>& devices);
     bool OnCpuThread() const { return std::this_thread::get_id() == cpuThread.load(std::memory_order_relaxed); }
     void Published(int pin, int level);
     void Forwarded(int ivg);

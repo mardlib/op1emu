@@ -1,4 +1,7 @@
+#include "cpu/cpu.h"
 #include "cpu/twi.h"
+#include "cpu/usb.h"
+#include "profiling/profiler.h"
 #include "profiling/service_stats.h"
 #include <cstdio>
 #include <cstdlib>
@@ -29,7 +32,7 @@ int main() {
     }
     {
         profiling::ServiceStats stats;
-        stats.SetDevices({{"USB", "USB"}});
+        stats.SetDevices({{"USB", "USB", {"Device"}}});
         stats.cpuThread.store(std::this_thread::get_id());
         std::thread other([&] {
             stats.Published(52, 1);
@@ -49,6 +52,27 @@ int main() {
         stats.Published(52, 1);
         Require(stats.pins[52].published == 1 && stats.pins[52].transitions == 1 && stats.sources[0].transitions == 1,
                 "the CPU thread's publication is attributed to the running source");
+    }
+    {
+        // The USB/IP thread publishes levels through the CPU's USB device at
+        // any time, also after the profiler is gone: the counts it reaches
+        // belong to the CPU and outlive the profiler.
+        BlackFinCpu cpu(true);
+        profiling::ServiceStats* stats = nullptr;
+        {
+            ProfilerOptions options;
+            options.censusPrefix = "service-stats-test";
+            Profiler profiler(options, cpu, [] {});
+            stats = &cpu.EnableServiceStats();
+            Require(stats == &cpu.EnableServiceStats(), "one set of counts per CPU");
+        }
+        const uint64_t before = stats->publishedOtherThreads;
+        std::thread usbip([&] {
+            const u8 packet[4] = {1, 2, 3, 4};
+            cpu.GetUSB().HandleDataWrite(1, 0, packet, sizeof(packet), [] {});
+        });
+        usbip.join();
+        Require(stats->publishedOtherThreads > before, "another thread's publications still land in live counts");
     }
     std::puts("ServiceStats tests passed");
 }
