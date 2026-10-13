@@ -126,10 +126,13 @@ add_executable(ldrdump tools/ldrdump.cpp)
 target_link_libraries(ldrdump emulator)
 
 # What the binary was built from (--build-info, and every profiling trace).
-set(OP1_BUILD_INFO_H "${CMAKE_BINARY_DIR}/generated/op1_build_info.h")
+# One header per configuration: a multi-config generator builds Debug and
+# Release from one tree, and CMAKE_BUILD_TYPE names neither.
+set(OP1_BUILD_INFO_DIR "${CMAKE_BINARY_DIR}/generated/$<CONFIG>")
+set(OP1_BUILD_INFO_H "${OP1_BUILD_INFO_DIR}/op1_build_info.h")
 add_custom_target(op1-build-info
     COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_SOURCE_DIR} -DOUTPUT=${OP1_BUILD_INFO_H}
-            -DBUILD_TYPE=${CMAKE_BUILD_TYPE} -DPROFILING=${ENABLE_PROFILING}
+            -DBUILD_TYPE=$<CONFIG> -DPROFILING=${ENABLE_PROFILING}
             "-DCOMPILER=${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
             -P ${CMAKE_SOURCE_DIR}/cmake/BuildInfo.cmake
     BYPRODUCTS ${OP1_BUILD_INFO_H}
@@ -138,7 +141,7 @@ add_custom_target(op1-build-info
 file(GLOB_RECURSE SOURCES gui/*.cpp)
 add_executable(op1emu ${SOURCES})
 add_dependencies(op1emu op1-build-info)
-target_include_directories(op1emu PRIVATE ${CMAKE_BINARY_DIR}/generated)
+target_include_directories(op1emu PRIVATE ${OP1_BUILD_INFO_DIR})
 target_link_libraries(op1emu PRIVATE emulator glfw OpenGL::GL nlohmann_json::nlohmann_json uvw ext Threads::Threads ${CMAKE_DL_LIBS})
 target_include_directories(op1emu PRIVATE ${stb_SOURCE_DIR} ${miniaudio_SOURCE_DIR})
 

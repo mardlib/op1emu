@@ -22,7 +22,9 @@ Every build records what it was built from: `op1emu --build-info` prints one
 line of JSON (`op1.build.v1`) with the host and bcore revisions, whether
 either had uncommitted changes to tracked files, the build type, whether
 profiling is on, and the compiler. A profiling run prints the same object
-as a `[build]` line before its marks and in the trace header (`build`).
+as a `[build]` line before its marks and in the trace header (`build`). With a
+multi-config generator each configuration gets its own header, so a Debug and
+a Release binary from one tree say which they are.
 
 `-DOP1_BUILD_HEADLESS_TESTS=ON` adds the firmware-free tests; with profiling
 on they include the mark-firing rule (`op1-mark-set-test`) and a profiling
@@ -339,7 +341,8 @@ binds the OTP image, and a different one changes the boot (with a mostly
 empty image the guest re-entered the bootrom early and never reached `lap-begin`).
 A run whose output passes 200 MiB is stopped and failed, before a runaway
 print can fill the disk. Each run also records the binary's `[build]` line;
-`--trace-events N` sizes the trace for a run longer than a stock boot.
+`--trace-events N` (on every command that runs the emulator) sizes the
+trace for a run longer than a stock boot.
 
 `verify --instrumentation` runs the binary once per instrumentation setting:
 marks and trace only, then with the census, the marks file's probes,
@@ -348,7 +351,9 @@ same guest work, block for block, and the report names the one that did
 not. Uninitialized memory once made one binary run 1,151,352,850 packets to
 `main-display` without a trace and 851 with one: what a diagnostic run
 showed was then not what a timing run did. Probes are skipped when the marks
-file declares none, counters when `kernel.perf_event_paranoid` is above 2. On a stock boot to `main-display` all six
+file declares none, counters when `kernel.perf_event_paranoid` is above 2. It refuses
+diagnostic options in `--arg`, which would switch one on in every
+configuration, the plain one included. On a stock boot to `main-display` all six
 settings ran the canonical 346,047,018 blocks and 1,151,352,850 packets,
 with 68,688 interrupts taken and 62,454 latched.
 

@@ -35,6 +35,8 @@ def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--min-mem-gb", type=float, default=10.0, help="refuse to start below this MemAvailable")
     parser.add_argument("--force", action="store_true", help="start despite preflight problems (recorded)")
     parser.add_argument("--out", type=Path, default=None, help="results directory (default op1prof-<time>)")
+    parser.add_argument("--trace-events", type=_positive, default=None, metavar="N",
+                        help="trace recorder capacity in events, for runs longer than a stock boot (default 262144)")
 
 
 def _checksum(parser: argparse.ArgumentParser) -> None:
@@ -111,7 +113,8 @@ def _spec(args, binary: Path) -> RunSpec:
                    timeout_s=args.timeout, progress_timeout_s=args.progress_timeout, cpu=args.cpu,
                    counters=getattr(args, "counters", False),
                    checksum_every=getattr(args, "checksum", None), checksum_from=getattr(args, "checksum_from", 0),
-                   probes=getattr(args, "probes", False), dump_pcs=getattr(args, "dump_pc", None) or [])
+                   probes=getattr(args, "probes", False), dump_pcs=getattr(args, "dump_pc", None) or [],
+                   trace_events=getattr(args, "trace_events", None))
 
 
 def _phase(args) -> tuple:
@@ -199,6 +202,14 @@ def cmd_verify(args) -> int:
 
 
 def _verify_instrumentation(args) -> int:
+    # Each setting is switched on in one configuration only: an --arg that
+    # enabled one everywhere would put it in the plain run as well, and a
+    # change it caused would compare equal.
+    _check_args(args.arg)
+    instrumented = instrument_args(list(args.arg))
+    if instrumented:
+        raise SystemExit(f"verify --instrumentation switches each setting on by itself and refuses "
+                         f"{instrumented} in --arg, which would switch it on in every configuration")
     if args.expect or args.write_expect or args.checksum or args.counters or args.runs != 2:
         raise SystemExit("--instrumentation runs every setting once (checksums and counters included); "
                          "it takes no --runs, --expect, --write-expect, --checksum or --counters")

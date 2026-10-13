@@ -1244,3 +1244,22 @@ def test_verify_instrumentation_names_the_setting_that_changes_the_workload(file
     assert "differences found" in out
     with pytest.raises(SystemExit, match="takes no --runs"):
         _cli(files, "verify", "--instrumentation", "--runs", "3", "--out", str(tmp_path / "x"))
+
+
+def test_verify_instrumentation_refuses_instrumentation_for_every_configuration(files, tmp_path):
+    # --arg reaches every configuration, the plain one included: a setting
+    # enabled there would be compared with itself.
+    with pytest.raises(SystemExit, match="switches each setting on by itself"):
+        _cli(files, "verify", "--instrumentation", "--arg=--profile-probes", "--out", str(tmp_path / "v"))
+    assert not (tmp_path / "v").exists()
+
+
+@pytest.mark.parametrize("command", ["run", "verify"])
+def test_trace_events_reach_the_emulator(files, tmp_path, command):
+    assert _cli(files, command, "--trace-events", "500000", "--out", str(tmp_path / "o")) == 0
+    report = json.loads((tmp_path / "o" / "results.json").read_text())
+    runs = [report["run"]] if command == "run" else report["runs"]
+    for entry in runs:
+        assert entry["command"][entry["command"].index("--profile-trace-events") + 1] == "500000"
+    with pytest.raises(SystemExit):
+        _cli(files, command, "--trace-events", "0", "--out", str(tmp_path / "z"))
