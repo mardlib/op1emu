@@ -42,6 +42,7 @@ class SPORT;
 class AudioOutput;
 class Profiler;
 struct BcoreStats;
+namespace profiling { struct ServiceStats; }
 class BcoreEventSink;
 
 class BlackFinCpu : public CpuInterface {
@@ -89,6 +90,8 @@ public:
     uint64_t EventsDelivered() const { return eventsDelivered_; }
     // Host-raised interrupts that set a new ILAT bit, per IVG level.
     const std::array<uint64_t, 16>& IrqLatched() const { return irqLatched_; }
+    // Count the host's service work (census runs); fills in the devices. Not owned.
+    void SetServiceStats(profiling::ServiceStats* stats);
     const CpuState& State() const { return *cpuState_; }
 #endif
     // Deterministic mode only: RTC calendar time at guest time zero.
@@ -99,6 +102,8 @@ protected:
     void ServicePanel();
     void ProcessEvents();
     void RaiseInterrupt(int ivg);
+    void QueueRaise(int ivg);
+    void ServiceDevicesCounted(int ivg);
 
     // Declared before the devices, which keep a reference to it.
     TimeSource time_;
@@ -126,6 +131,7 @@ protected:
     Profiler* profiler_ = nullptr;
     uint64_t eventsDelivered_ = 0;
     std::array<uint64_t, 16> irqLatched_{};
+    profiling::ServiceStats* service_ = nullptr;
 #endif
     // Last cyclesElapsed value the GP timers were advanced to (see Run()).
     uint64_t lastTimerCycles_ = 0;

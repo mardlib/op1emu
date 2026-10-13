@@ -4,6 +4,7 @@
 #include "hw_counters.h"
 #include "mark_set.h"
 #include "probes.h"
+#include "service_stats.h"
 #include "sha256.h"
 #include "utils/log.h"
 #include "core.h"
@@ -26,6 +27,7 @@
 #include <map>
 #include <stdexcept>
 #include <unistd.h>
+#include <thread>
 #include <unordered_map>
 
 namespace {
@@ -139,6 +141,7 @@ struct Profiler::Impl : BcoreEventSink {
     uint64_t endWall = 0;
 
     bool census = false;
+    profiling::ServiceStats service;
     struct PcCount { uint64_t runs = 0, packets = 0; };
     struct MmioCount {
         uint64_t reads = 0, writes = 0;
@@ -290,6 +293,7 @@ struct Profiler::Impl : BcoreEventSink {
                 throw std::runtime_error("Cannot open perf control fifo " + options.perfFifo + ": " + std::strerror(errno));
         }
         census = !options.censusPrefix.empty();
+        if (census) cpu.SetServiceStats(&service);
         if (!options.checksumPath.empty()) {
             if (options.checksumEvery == 0) throw std::runtime_error("--profile-checksum-every must be at least 1");
             checksums = std::fopen(options.checksumPath.c_str(), "wb");
@@ -428,6 +432,7 @@ struct Profiler::Impl : BcoreEventSink {
     void Start(uint32_t pc) {
         started = true;
         cpuTid = static_cast<long>(gettid());
+        service.cpuThread = std::this_thread::get_id();
         if (options.counters) {
             std::string error;
             if (!hw.Open(error) || !hw.Read(startHw)) {
@@ -612,7 +617,8 @@ struct Profiler::Impl : BcoreEventSink {
         const bool ok =
             WriteCensus(base + "pc." + mark, pcCensus, [](const PcCount& c) { return std::pair{c.runs, c.packets}; }) &&
             WriteCensus(base + "mmio." + mark, mmioCensus, [](const MmioCount& c) { return std::pair{c.reads, c.writes}; }) &&
-            WriteEdges(base + "edge." + mark) && WriteMmioFirst(base + "mmiofirst." + mark);
+            WriteEdges(base + "edge." + mark) && WriteMmioFirst(base + "mmiofirst." + mark) &&
+            service.Write(base + "service." + mark, cpu.IrqLatched(), cpu.CoreStats());
         if (!ok) {
             LogError("Failed to write census %s*.%s", base.c_str(), mark);
             censusFailed = true;
@@ -804,6 +810,7 @@ bool Profiler::Finish() {
     auto& impl = *impl_;
     impl.endWall = MonotonicNs();
     impl.cpu.SetCoreEventSink(nullptr);
+    if (impl.census) impl.cpu.SetServiceStats(nullptr);
     // A thread that ran on an efficiency core (or shared the counters with
     // another user) counted only part of the time: partial instruction
     // counts would read as a speedup. The last check covers the tail.

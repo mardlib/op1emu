@@ -18,6 +18,10 @@
 #include "emu.h"
 #ifdef ENABLE_PROFILING
 #include "profiling/profiler.h"
+#include "profiling/service_stats.h"
+#include <cstdlib>
+#include <cxxabi.h>
+#include <typeinfo>
 #endif
 #include "peripheral/mcp230xx.h"
 #include "peripheral/adxl345.h"
@@ -197,16 +201,17 @@ BlackFinCpu::BlackFinCpu(bool deterministic) : time_(deterministic), pc(0) {
     sic = std::make_shared<SIC>(0xFFC00100);
     sic->SetInterruptForwardCallback([this](int ivg, int level) {
         if (level) {
-            QueueEvent([this, ivg]() { RaiseInterrupt(ivg); });
+#ifdef ENABLE_PROFILING
+            if (service_ && ivg >= 0 && ivg < 16) ++service_->forwarded[ivg];
+#endif
+            QueueRaise(ivg);
         }
     });
     devices.push_back(sic);
     nfc->SetIVGResolver([this]() { return sic->GetIVG(IRQ_NFC); });
     coreTimer = std::make_shared<CoreTimer>(0xFFE03000, time_);
     coreTimer->BindInterrupt(IVG_IVTMR, [this](int ivg, int level) {
-        if (level) {
-            QueueEvent([this, ivg]() { RaiseInterrupt(ivg); });
-        }
+        if (level) QueueRaise(ivg);
     });
     devices.emplace_back(coreTimer);
 
@@ -305,6 +310,9 @@ BlackFinCpu::~BlackFinCpu() {
 }
 
 void BlackFinCpu::ProcessInterrupt(int pin, int level) {
+#ifdef ENABLE_PROFILING
+    if (service_) service_->Published(pin, level);
+#endif
     sic->SetInterruptLevel(pin, level);
 }
 
@@ -347,6 +355,9 @@ HaltReason BlackFinCpu::Run() {
         if (profiler_) profiler_->AfterInvalidate();
 #endif
     }
+#ifdef ENABLE_PROFILING
+    if (service_) service_->current = service_->block;
+#endif
     // Execute one basic block — bcore updates cpuState_->pc internally.
     // Hardware loops, PC advance, and hwloop counters are all handled by bcore.
     if (!core_->run(cpuState_->pc)) {
@@ -365,6 +376,12 @@ HaltReason BlackFinCpu::Run() {
 
     // Get active IVG from CEC
     int ivg = cec_current_ivg();
+#ifdef ENABLE_PROFILING
+    if (service_) {
+        service_->current = service_->other;
+        ServiceDevicesCounted(ivg);
+    } else
+#endif
     for (const auto& device : devices) {
         device->ProcessWithInterrupt(ivg);
     }
@@ -389,7 +406,12 @@ HaltReason BlackFinCpu::Run() {
     uint64_t ticks = ((uint64_t)cyclesElapsed - lastTimerCycles_) / kCyclesPerTimerTick;
     if (ticks) {
         lastTimerCycles_ += ticks * kCyclesPerTimerTick;
-        if (ticks > kMaxCatchupTicks) ticks = kMaxCatchupTicks;
+        if (ticks > kMaxCatchupTicks) {
+#ifdef ENABLE_PROFILING
+            if (service_) service_->timerTicksDropped += ticks - kMaxCatchupTicks;
+#endif
+            ticks = kMaxCatchupTicks;
+        }
         for (uint64_t i = 0; i < ticks; ++i) {
             gptimer->Tick(GPTimerClockTypeSCLK);
             gptimer->Tick(GPTimerClockTypeTACLK);
@@ -472,7 +494,55 @@ u32 BlackFinCpu::PC() {
 void BlackFinCpu::QueueEvent(const std::function<void()>& event, std::chrono::nanoseconds delay) {
     std::unique_lock<std::recursive_mutex> lock(eventQueueMutex);
     eventQueue.push_back({delay, event});
+#ifdef ENABLE_PROFILING
+    if (service_) service_->Queued();
+#endif
 }
+
+void BlackFinCpu::QueueRaise(int ivg) {
+#ifdef ENABLE_PROFILING
+    if (service_) service_->raising = true;
+#endif
+    QueueEvent([this, ivg]() { RaiseInterrupt(ivg); });
+#ifdef ENABLE_PROFILING
+    if (service_) service_->raising = false;
+#endif
+}
+
+#ifdef ENABLE_PROFILING
+void BlackFinCpu::SetServiceStats(profiling::ServiceStats* stats) {
+    service_ = stats;
+    if (!stats) return;
+    std::vector<std::pair<std::string, std::string>> names;
+    for (const auto& device : devices) {
+        const auto& value = *device;
+        int status = 0;
+        char* type = abi::__cxa_demangle(typeid(value).name(), nullptr, nullptr, &status);
+        names.emplace_back(device->Name(), status == 0 && type ? type : typeid(value).name());
+        std::free(type);
+    }
+    stats->SetDevices(names);
+}
+
+// The device loop of Run() with each call counted, and counted as productive
+// when it changed an interrupt level, queued an event other than a raise, or
+// moved data. Taken only in census runs.
+void BlackFinCpu::ServiceDevicesCounted(int ivg) {
+    auto& stats = *service_;
+    for (size_t i = 0; i < devices.size(); ++i) {
+        auto& source = stats.sources[i];
+        const uint64_t before = source.transitions + source.queued;
+        const uint64_t work = devices[i]->ServiceWork();
+        stats.current = static_cast<int>(i);
+        devices[i]->ProcessWithInterrupt(ivg);
+        const uint64_t moved = devices[i]->ServiceWork() - work;
+        source.work += moved;
+        ++source.calls;
+        if (moved || source.transitions + source.queued != before) ++source.productive;
+    }
+    stats.current = stats.other;
+}
+#endif
 
 void BlackFinCpu::RaiseInterrupt(int ivg) {
 #ifdef ENABLE_PROFILING
@@ -481,6 +551,7 @@ void BlackFinCpu::RaiseInterrupt(int ivg) {
     // something the guest can see.
     const uint32_t ilatAddr = CEC_MMR_BASE + 4 * CEC_IDX_ILAT;
     const uint32_t before = cec_mmr_read(cpuState_.get(), ilatAddr);
+    if (service_ && ivg >= 0 && ivg < 16) ++service_->raised[ivg];
     cec_raise(cpuState_.get(), ivg);
     const uint32_t latched = cec_mmr_read(cpuState_.get(), ilatAddr) & ~before;
     for (int level = 0; level < 16; ++level)
@@ -493,6 +564,16 @@ void BlackFinCpu::RaiseInterrupt(int ivg) {
 void BlackFinCpu::ProcessEvents() {
     std::unique_lock<std::recursive_mutex> lock(eventQueueMutex);
     constexpr std::chrono::nanoseconds instructionTime(1); // Approximate instruction execution time
+#ifdef ENABLE_PROFILING
+    if (service_) {
+        const uint64_t length = eventQueue.size();
+        ++service_->processCalls;
+        service_->nonEmptyCalls += length != 0;
+        service_->lengthSum += length;
+        if (length > service_->lengthMax) service_->lengthMax = length;
+        service_->current = service_->events;
+    }
+#endif
     auto events = eventQueue;
     for (auto& [delay, event] : events) {
         if (delay <= std::chrono::nanoseconds(0)) {
@@ -513,6 +594,9 @@ void BlackFinCpu::ProcessEvents() {
         }
     }
     elapsedTime += instructionTime;
+#ifdef ENABLE_PROFILING
+    if (service_) service_->current = service_->other;
+#endif
 }
 
 void BlackFinCpu::AttachDisplay(const std::shared_ptr<Display>& display) {

@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from op1prof import ab, census, cli, compilation, machine, stats, trace, verify  # noqa: E402
+from op1prof import ab, census, cli, compilation, machine, service, stats, trace, verify  # noqa: E402
 from op1prof.marks import parse_mark, workload_diff, parse_marks  # noqa: E402
 from op1prof.runner import RESERVED_ARGS, RunSpec, run, snapshot_binary, sha256_file  # noqa: E402
 
@@ -407,6 +407,19 @@ def test_buckets_prefer_the_nearest_frame_then_rule_order():
     assert categories.bucket(["OTG_USB::Poll()"]) == "uncategorized"     # patterns start a name
     assert categories.bucket(["std::function<void ()>::operator()", "DummyI2CPeripheral::Read()"]) == "gpio/twi/sensors"
     assert not categories.complete(["memcpy", "[unknown]"])
+
+
+
+def test_a_devices_own_register_reads_are_its_time_and_guest_reads_are_memory_callbacks():
+    categories = Categories.load()
+    lookup = ["std::_Rb_tree<unsigned int, ...>::find(unsigned int const&)", "RegisterDevice::Read32(unsigned int)"]
+    # The RTC polling its own registers after every block.
+    assert categories.bucket(lookup + ["RTC::UpdateInterrupts()", "RTC::ProcessWithInterrupt(int)",
+                                       "BlackFinCpu::Run()"]) == "rtc"
+    # Generated code reading an MMR: the dispatch is the memory path.
+    assert categories.bucket(lookup + ["Emulator::MemoryRead32(unsigned int)", "EmulatorMemory::read32(unsigned int) const",
+                                       "mem_read32", "bb_0x01a5e27e", "BlackFinCpu::Run()"]) == "memory callbacks"
+    assert categories.bucket(["mem_read16", "bb_0x01a5e27e"]) == "memory callbacks"
 
 
 def _capture(tmp_path, trace_data, marks=()):
@@ -1263,3 +1276,86 @@ def test_trace_events_reach_the_emulator(files, tmp_path, command):
         assert entry["command"][entry["command"].index("--profile-trace-events") + 1] == "500000"
     with pytest.raises(SystemExit):
         _cli(files, command, "--trace-events", "0", "--out", str(tmp_path / "z"))
+
+
+# ---- service census ----
+
+def _service_dump(path, scale, dropped=0):
+    """A cumulative service dump: two RTCs-worth of polling, a DMA that moves data."""
+    def source(name, type_, device, calls, productive, published, transitions, queued=0, raises=0, work=0):
+        return {"name": name, "type": type_, "device": device, "calls": calls, "productive": productive,
+                "published": published, "transitions": transitions, "queued": queued, "raises": raises,
+                "work": work}
+    data = {"schema": "op1.service.v1",
+            "sources": [source("RTC", "RTC", True, 1000 * scale, 2 * scale, 1000 * scale, 2 * scale),
+                        source("DMA", "DMA", True, 1000 * scale, 10 * scale, 0, 0, work=4096 * scale),
+                        source("TWI", "TWI", True, 1000 * scale, 0, 0, 0),
+                        source("block", "", False, 0, 0, 30 * scale, 3 * scale, queued=5 * scale),
+                        source("events", "", False, 0, 0, 0, 0),
+                        source("other", "", False, 0, 0, 0, 0, raises=900 * scale)],
+            "pins": [{"pin": 26, "published": 1000 * scale, "transitions": 2 * scale, "source": "RTC"}],
+            "ivg": [{"level": 9, "forwarded": 900 * scale, "raised": 900 * scale, "latched": 3 * scale,
+                     "entered": 3 * scale}] + [{"level": lvl, "forwarded": 0, "raised": 0, "latched": 0, "entered": 0}
+                                              for lvl in range(10, 16)],
+            "queue": {"process_calls": 1000 * scale, "nonempty_calls": 900 * scale, "length_sum": 950 * scale,
+                      "length_max": 4, "queued_other_threads": 2},
+            "timer_ticks_dropped": dropped,
+            "bcore": {"cache_hits": 990 * scale, "cache_misses": 10 * scale, "blocks_executed": 1000 * scale}}
+    path.write_text(json.dumps(data))
+
+
+def test_service_phase_differences_and_report(tmp_path):
+    prefix = tmp_path / "census"
+    _service_dump(Path(f"{prefix}.service.a"), 1)
+    _service_dump(Path(f"{prefix}.service.b"), 3, dropped=5)
+    data = service.phase(prefix, "a", "b")
+    rtc = data["sources"][0]
+    assert rtc["calls"] == 2000 and rtc["productive"] == 4 and rtc["transitions"] == 4
+    assert data["pins"] == [{"pin": 26, "source": "RTC", "published": 2000, "transitions": 4}]
+    assert [r["level"] for r in data["ivg"]] == [9] and data["ivg"][0]["raised"] == 1800
+    assert data["queue"]["process_calls"] == 2000 and data["queue"]["queued_other_threads"] == 0
+    text = service.report(data, 10)
+    assert "RTC                RTC                   2,000          4    0.20%" in text
+    assert "and 1 devices called 2,000 times or fewer that never did anything: TWI" in text
+    assert "\nTWI " not in text
+    assert "   26 RTC                       2,000           4    0.20%" in text
+    assert "0.950 events waiting on average" in text and "warning: 5 GP timer ticks were dropped" in text
+    with pytest.raises(ValueError, match="went down"):
+        service.phase(prefix, "b", "a")
+    with pytest.raises(ValueError, match="no service census"):
+        service.phase(prefix, "a", "zz")
+
+
+def test_service_join_prices_calls_and_refuses_other_work():
+    def mark(packets):
+        return parse_mark(f"[mark] b pc=0x0 wall_ms=0 cpu_ms=0 runs=1 packets={packets} cycles={packets} "
+                          "translated=1 mmio_r=0 mmio_w=0 events=0")
+    def data():
+        return {"phase": ["a", "b"], "sources": [
+            {"name": "PORTF", "type": "GPIO", "device": True, "calls": 1000, "productive": 0},
+            {"name": "PORTG", "type": "GPIO", "device": True, "calls": 1000, "productive": 10},
+            {"name": "block", "type": "", "device": False, "calls": 0, "productive": 0}]}
+    capture = {"window": ["a", "b"], "inclusive_valid": True, "event": "cycles:u",
+               "host_inclusive": [{"symbol": "GPIO::ProcessWithInterrupt(int)", "seconds": 0.002}]}
+    joined = service.join(data(), capture, [mark(5)], [mark(5)])
+    portg = joined["sources"][1]
+    assert portg["seconds"] == pytest.approx(0.001) and portg["ns_per_call"] == pytest.approx(1000.0)
+    assert portg["ns_per_productive"] == pytest.approx(100_000.0) and joined["sources"][0]["ns_per_productive"] is None
+    with pytest.raises(ValueError, match="different guest work"):
+        service.join(data(), capture, [mark(5)], [mark(6)])
+    with pytest.raises(ValueError, match="window"):
+        service.join(data(), {**capture, "window": ["a", "c"]}, [mark(5)], [mark(5)])
+    with pytest.raises(ValueError, match="lbr"):
+        service.join(data(), {**capture, "inclusive_valid": False}, [mark(5)], [mark(5)])
+
+
+def test_service_command(tmp_path, capsys):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _service_dump(run_dir / "census.service.a", 1)
+    _service_dump(run_dir / "census.service.b", 2)
+    out = tmp_path / "service.json"
+    assert cli.main(["service", str(run_dir), "--phase", "a:b", "--json", str(out)]) == 0
+    assert "event queue: 1,000 ProcessEvents calls" in capsys.readouterr().out
+    assert json.loads(out.read_text())["schema"] == "op1prof.service.v1"
+    assert cli.main(["service", str(run_dir), "--phase", "a:missing"]) == 2

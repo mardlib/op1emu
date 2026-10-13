@@ -1,0 +1,169 @@
+"""The service census (--profile-census, op1.service.v1): how often the host
+services each device around a block, how often that did anything, the
+interrupt chain from a device's level to the CEC, and the CPU event queue."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+from .marks import Mark, parse_marks, workload_diff
+
+SCHEMA = "op1.service.v1"
+SOURCE_FIELDS = ("calls", "productive", "published", "transitions", "queued", "raises", "work")
+QUEUE_FIELDS = ("process_calls", "nonempty_calls", "length_sum", "queued_other_threads")
+IVG_FIELDS = ("forwarded", "raised", "latched", "entered")
+
+
+def load(prefix: Path, mark: str) -> dict:
+    path = Path(f"{prefix}.service.{mark}")
+    if not path.is_file():
+        raise ValueError(f"{path}: no service census (recorded by an emulator before it, or the mark did not fire)")
+    data = json.loads(path.read_text())
+    if data.get("schema") != SCHEMA:
+        raise ValueError(f"{path}: not a service census ({SCHEMA})")
+    return data
+
+
+def _minus(after: int, before: int, what: str, begin: str, end: str) -> int:
+    if after < before:
+        raise ValueError(f"service counts went down for {what}: {begin} is not before {end}")
+    return after - before
+
+
+def phase(prefix: Path, begin: str, end: str) -> dict:
+    """Counts between two marks (dumps are cumulative). The queue's longest
+    length is the longest up to `end`, not within the phase."""
+    a, b = load(prefix, begin), load(prefix, end)
+    if [s["name"] for s in a["sources"]] != [s["name"] for s in b["sources"]]:
+        raise ValueError("the two dumps list different devices")
+    sources = []
+    for before, after in zip(a["sources"], b["sources"]):
+        sources.append({"name": after["name"], "type": after["type"], "device": after["device"],
+                        **{k: _minus(after[k], before[k], after["name"], begin, end) for k in SOURCE_FIELDS}})
+    pins_a = {p["pin"]: p for p in a["pins"]}
+    pins = []
+    for p in b["pins"]:
+        q = pins_a.get(p["pin"], {"published": 0, "transitions": 0})
+        row = {"pin": p["pin"], "source": p["source"],
+               **{k: _minus(p[k], q[k], f"pin {p['pin']}", begin, end) for k in ("published", "transitions")}}
+        if row["published"]:
+            pins.append(row)
+    ivg = []
+    for x, y in zip(a["ivg"], b["ivg"]):
+        row = {"level": y["level"], **{k: _minus(y[k], x[k], f"IVG{y['level']}", begin, end) for k in IVG_FIELDS}}
+        if any(row[k] for k in IVG_FIELDS):
+            ivg.append(row)
+    queue = {k: _minus(b["queue"][k], a["queue"][k], f"queue {k}", begin, end) for k in QUEUE_FIELDS}
+    queue["length_max_so_far"] = b["queue"]["length_max"]
+    return {"schema": "op1prof.service.v1", "phase": [begin, end], "sources": sources, "pins": pins, "ivg": ivg,
+            "queue": queue,
+            "timer_ticks_dropped": _minus(b["timer_ticks_dropped"], a["timer_ticks_dropped"], "timer ticks",
+                                          begin, end),
+            "bcore": {k: _minus(b["bcore"][k], a["bcore"][k], k, begin, end) for k in b["bcore"]}}
+
+
+def _service_symbol(type_name: str) -> str:
+    return f"{type_name}::ProcessWithInterrupt("
+
+
+def join(data: dict, capture_report: dict, capture_marks: List[Mark], run_marks: List[Mark]) -> dict:
+    """Price each device's service calls with a perf capture of the same
+    work: the inclusive time of its ProcessWithInterrupt over its calls and
+    over its productive calls. The census changes timing, so the prices come
+    from another run, which must have done exactly the same guest work."""
+    if tuple(capture_report["window"]) != tuple(data["phase"]):
+        raise ValueError(f"the capture's window {capture_report['window']} is not the phase {data['phase']}")
+    if not capture_report.get("inclusive_valid"):
+        raise ValueError("pricing service calls needs whole call chains: capture with --call-graph lbr")
+    diff = workload_diff(capture_marks, run_marks)
+    if diff:
+        raise ValueError("the census run did different guest work than the capture: " + "; ".join(diff[:5]))
+    inclusive = capture_report["host_inclusive"]
+    for source in data["sources"]:
+        if not source["device"]:
+            continue
+        prefix = _service_symbol(source["type"])
+        seconds = sum(row["seconds"] for row in inclusive if row["symbol"].startswith(prefix))
+        # Devices of one class share a symbol: split by calls.
+        same = [s for s in data["sources"] if s["device"] and s["type"] == source["type"]]
+        calls = sum(s["calls"] for s in same)
+        share = seconds * source["calls"] / calls if calls else 0.0
+        source["seconds"] = share
+        source["ns_per_call"] = share * 1e9 / source["calls"] if source["calls"] else None
+        source["ns_per_productive"] = share * 1e9 / source["productive"] if source["productive"] else None
+    data["priced_by"] = capture_report.get("event")
+    return data
+
+
+def _pct(part: int, whole: int) -> str:
+    if not whole:
+        return "      -"
+    share = part / whole * 100
+    # A rare useful call (a few thousand in hundreds of millions) is the
+    # point of the table: never round it to zero.
+    return f"{share:6.2f}%" if share >= 0.01 or not part else f"{share:6.0e}%"
+
+
+def report(data: dict, top: int) -> str:
+    begin, end = data["phase"]
+    priced = "priced_by" in data
+    called = [s for s in data["sources"] if s["device"] and s["calls"]]
+    # Devices that never published a level nor did anything are summarized,
+    # unless a capture gave them time.
+    quiet = [s for s in called if not s["published"] and not s["productive"] and not s.get("seconds")]
+    devices = sorted((s for s in called if s not in quiet),
+                     key=lambda s: -(s.get("seconds") or 0) if priced else -s["published"])
+    lines = [f"service {begin} -> {end}: devices serviced after every block; a call is productive when it "
+             "changed an interrupt level, queued an event other than an interrupt raise, or moved data",
+             "", f"{'device':18s} {'class':14s} {'calls':>12} {'productive':>10} {'':>8} {'published':>12} {'transitions':>11}"
+             f" {'raises':>10} {'work':>12}" + (f" {'seconds':>8} {'ns/call':>8} {'ns/prod':>10}" if priced else "")]
+    for s in devices[:top]:
+        row = (f"{s['name'][:18]:18s} {s['type'][:14]:14s} {s['calls']:>12,} {s['productive']:>10,}"
+               f" {_pct(s['productive'], s['calls']):>8}"
+               f" {s['published']:>12,} {s['transitions']:>11,} {s['raises']:>10,} {s['work']:>12,}")
+        if priced:
+            npc, npp = s.get("ns_per_call"), s.get("ns_per_productive")
+            row += (f" {s['seconds']:8.3f} {npc if npc is not None else 0:8.1f}"
+                    f" {f'{npp:,.0f}' if npp is not None else '-':>10}")
+        lines.append(row)
+    if quiet:
+        lines.append(f"and {len(quiet)} devices called {max(q['calls'] for q in quiet):,} times or fewer that never "
+                     "did anything: " + ", ".join(q["name"] for q in quiet))
+    others = [s for s in data["sources"] if not s["device"] and (s["published"] or s["queued"] or s["raises"])]
+    if others:
+        lines += ["", f"{'outside the device loop':33s} {'published':>12} {'transitions':>11} {'queued':>10}"
+                  f" {'raises':>10}"]
+        for s in others:
+            lines.append(f"{s['name']:33s} {s['published']:>12,} {s['transitions']:>11,} {s['queued']:>10,}"
+                         f" {s['raises']:>10,}")
+    if data["pins"]:
+        lines += ["", f"{'SIC pin':>7} {'first published by':18s} {'published':>12} {'transitions':>11}"
+                  f" {'useful':>8}"]
+        for p in sorted(data["pins"], key=lambda p: -p["published"])[:top]:
+            lines.append(f"{p['pin']:>7} {p['source'][:18]:18s} {p['published']:>12,} {p['transitions']:>11,}"
+                         f" {_pct(p['transitions'], p['published']):>8}")
+    if data["ivg"]:
+        lines += ["", "interrupt chain per IVG: raises the SIC forwarded (every pending pin again whenever any level "
+                  "is published), raises delivered to the CEC, new ILAT bits, entries",
+                  f"{'IVG':>4} {'forwarded':>12} {'raised':>12} {'latched':>9} {'entered':>9} {'latched/raised':>14}"]
+        for r in data["ivg"]:
+            lines.append(f"{r['level']:>4} {r['forwarded']:>12,} {r['raised']:>12,} {r['latched']:>9,}"
+                         f" {r['entered']:>9,} {_pct(r['latched'], r['raised']):>14}")
+    q = data["queue"]
+    calls = q["process_calls"]
+    lines += ["", f"event queue: {calls:,} ProcessEvents calls, {_pct(q['nonempty_calls'], calls).strip()} with "
+              f"events, {q['length_sum'] / calls if calls else 0:.3f} events waiting on average, at most "
+              f"{q['length_max_so_far']} up to {end}; {q['queued_other_threads']:,} queued by other threads"]
+    b = data["bcore"]
+    lines.append(f"bcore: {b['blocks_executed']:,} blocks executed, {b['cache_hits']:,} cache hits, "
+                 f"{b['cache_misses']:,} misses")
+    if data["timer_ticks_dropped"]:
+        lines.append(f"warning: {data['timer_ticks_dropped']:,} GP timer ticks were dropped (more than 64 due after "
+                     "one block): the guest lost timer time")
+    lines.append("Counts are work, not cost; --capture prices the device calls.")
+    return "\n".join(lines)
+
+
+def run_marks(run: Path) -> List[Mark]:
+    return parse_marks((run / "log.txt").read_text(errors="replace").splitlines())
