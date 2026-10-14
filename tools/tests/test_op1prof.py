@@ -1935,10 +1935,16 @@ def test_a_capture_keeps_perfs_build_id_cache_inside_itself(files, tmp_path, mon
         from dataclasses import replace
         return replace(spec, prefix=[])
     monkeypatch.setattr(perf, "run", fake_run)
+    # perf inject runs after a reached run: recorded here, so the test needs no perf.
+    class Done:
+        returncode, stderr = 0, ""
+    commands = []
+    monkeypatch.setattr(perf.subprocess, "run", lambda command, **kw: commands.append(command) or Done())
     capture = tmp_path / "capture"
     perf.record(spec(files), capture, ("start", "main-frame"), "cycles:u", 4000000, None)
     cache = (capture / perf.BUILDID_DIR).resolve()
     assert cache.is_dir() and seen["prefix"][:4] == ["perf", "--buildid-dir", str(cache), "record"]
+    assert [c[:4] for c in commands] == [["perf", "--buildid-dir", str(cache), "inject"]]
     assert perf.perf_command(capture) == ["perf", "--buildid-dir", str(cache)]
     old = tmp_path / "old-capture"
     old.mkdir()
