@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from op1prof import ab, census, cli, compilation, exits, machine, service, stats, trace, verify  # noqa: E402
+from op1prof import ab, census, cli, compilation, diff, exits, machine, service, stats, trace, verify  # noqa: E402
 from op1prof.marks import parse_mark, workload_diff, parse_marks  # noqa: E402
 from op1prof.runner import RESERVED_ARGS, RunSpec, run, snapshot_binary, sha256_file  # noqa: E402
 
@@ -1563,3 +1563,88 @@ def test_logging_is_its_own_bucket():
     assert categories.bucket(["vsnprintf", "LogImpl(LogLevel, char const*, __va_list_tag*)",
                               "LogDebug(char const*, ...)", "get_device(unsigned int, ...)",
                               "Emulator::MemoryRead32(unsigned int)"]) == "logging"
+
+
+# ---- diff and ab phases ----
+
+def _census_dir(path, blocks, mmio, marks):
+    path.mkdir()
+    for mark, rows in blocks.items():
+        _census(path / f"census.pc.{mark}", rows)
+        _census(path / f"census.mmio.{mark}", mmio[mark])
+    (path / "log.txt").write_text("\n".join(map(_mark_line, marks)) + "\n")
+
+
+def test_diff_census_names_the_blocks_and_phase_that_changed(tmp_path, capsys):
+    marks = [_mark_entry("a", 10), _mark_entry("b", 20)]
+    _census_dir(tmp_path / "A", {"a": [(0x100, 1, 4)], "b": [(0x100, 5, 20), (0x200, 3, 3)]},
+                {"a": [], "b": [(0xffc00300, 2, 0)]}, marks)
+    _census_dir(tmp_path / "B", {"a": [(0x100, 1, 4)], "b": [(0x100, 9, 24), (0x300, 2, 2)]},
+                {"a": [], "b": [(0xffc00300, 3, 0)]}, [marks[0], _mark_entry("b", 21)])
+    data = diff.census_diff(tmp_path / "A", tmp_path / "B", "a", "b")
+    rows = {r["key"]: r for r in data["blocks"]}
+    assert rows[0x100]["delta"] == [4, 4] and rows[0x200]["only"] == "a" and rows[0x300]["only"] == "b"
+    assert data["first_difference"]["mark"] == "b" and data["first_difference"]["after"] == "a"
+    text = diff.census_report(data, 10, census.Symbols(None))
+    assert "guest work first differs in a -> b" in text
+    assert "0x00000300            0            2             0             2           +2  (only in B)" in text
+    assert cli.main(["diff", "census", str(tmp_path / "A"), str(tmp_path / "A"), "--phase", "a:b",
+                     "--json", str(tmp_path / "same.json")]) == 0
+    out = capsys.readouterr().out
+    assert "guest work identical at every mark" in out and "every block ran the same number of times" in out
+    assert json.loads((tmp_path / "same.json").read_text())["blocks"] == []
+    assert cli.main(["diff", "census", str(tmp_path / "A"), str(tmp_path / "B")]) == 2   # no phase
+
+
+def _compile_run(path, blocks):
+    """A run directory whose trace compiled `blocks`: (pc, hash, ir, bytes)."""
+    path.mkdir()
+    events = [_mark("a", 0, 0, 0)]
+    for i, (pc, digest, ir, size) in enumerate(blocks):
+        events.append({**_translate(10 + i, 1, 1000), "args": {"pc": pc, "ok": True, "cpu_ns": 1000 * (i + 1),
+                                                                "ir_insns": ir, "object_bytes": size,
+                                                                "object_hash": digest}})
+    events.append(_mark("b", 1000, 0, 0))
+    (path / "trace.json").write_text(json.dumps(_trace(events)))
+
+
+def test_diff_compile_aligns_blocks_by_code_and_weighs_them_by_work(tmp_path, capsys):
+    _compile_run(tmp_path / "A", [(0x100, "1" * 16, 10, 40), (0x200, "2" * 16, 20, 80), (0x400, "4" * 16, 5, 9)])
+    _compile_run(tmp_path / "B", [(0x100, "1" * 16, 10, 40), (0x200, "9" * 16, 12, 50), (0x300, "3" * 16, 7, 9)])
+    data = diff.compile_diff(tmp_path / "A", tmp_path / "B", ("a", "b"))
+    assert data["counts"] == {"same": 1, "changed": 1, "only a": 1, "only b": 1}
+    weights = tmp_path / "W"
+    weights.mkdir()
+    _census(weights / "census.pc.a", [])
+    _census(weights / "census.pc.b", [(0x100, 10, 30), (0x200, 50, 70)])
+    weighed = diff.compile_diff(tmp_path / "A", tmp_path / "B", ("a", "b"), weights)
+    assert weighed["changed_packets"] == 70 and weighed["unchanged_packets"] == 30
+    text = diff.compile_report(weighed, 10, census.Symbols(None))
+    assert "blocks whose code changed executed 70.0% of the phase's packets" in text
+    assert "0x00000200      20      12       80       50" in text
+    assert "compiled only in A: 0x00000400" in text and "compiled only in B: 0x00000300" in text
+    with pytest.raises(ValueError, match="give --phase"):
+        diff.compile_diff(tmp_path / "A", tmp_path / "B", None, weights)
+    assert cli.main(["diff", "compile", str(tmp_path / "A"), str(tmp_path / "B"), "--phase", "a:b",
+                     "--census", str(weights)]) == 0
+
+
+def test_ab_reports_each_phase_and_the_shape(files, tmp_path, capsys):
+    out = tmp_path / "ab"
+    out.mkdir()
+    slow = tmp_path / "slow.sh"
+    slow.write_text(f"#!/bin/sh\nFAKE_SCALE=1.2 exec {FAKE} \"$@\"\n")
+    slow.chmod(0o755)
+    report = ab.compare(_side("base", files, out), ab.Side("new", snapshot_binary(slow, out), [], sha256_file(slow)),
+                        spec(files), 4, out, ("start", "main-frame"), 2.0, False)
+    assert report["schema"] == ab.SCHEMA
+    phases = {(p["begin"], p["end"]): p for p in report["phases"]}
+    assert set(phases) == {("start", "bootrom"), ("bootrom", "main-display"), ("main-display", "main-frame")}
+    assert phases[("bootrom", "main-display")]["noncompile_cpu_ms"]["mean_pct"] == pytest.approx(20.0)
+    assert phases[("bootrom", "main-display")]["compile_cpu_ms"]["median_delta_ms"] == 0
+    assert report["shape"]["base"]["runs"] == report["shape"]["new"]["runs"]
+    assert report["shape"]["base"]["packets_per_run"] == pytest.approx(3.0, rel=0.01)
+    cli._print_ab(report, out)
+    printed = capsys.readouterr().out
+    assert "shape at main-frame (base -> new): runs 1,000 -> 1,000" in printed
+    assert "bootrom -> main-display" in printed and "+20.0%" in printed
