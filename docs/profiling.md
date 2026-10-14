@@ -614,7 +614,8 @@ does. One whose method cannot be found is shown as `?`, never as a zero. It need
 
 `diff census A B --phase BEGIN:END` compares two census runs: total block
 runs, packets and MMR accesses; the first mark at which their guest work
-differs; the blocks that gained or lost the most packets, and those that
+differs (both runs in firing order: a mark that fired on one side only is a
+difference there too); the blocks that gained or lost the most packets, and those that
 ran on one side only; the MMRs whose accesses changed; and, when both runs
 have them, the service and exit censuses. Blocks that ran a different
 number of times for the same packets were formed differently. With
@@ -623,12 +624,18 @@ the fix that left instruction fetches out of the memory census, show the
 same work at every mark and differ only in 832,069,596 against 831,806,301
 guest memory accesses.
 
-`diff compile A B [--phase BEGIN:END] [--census RUNDIR]` aligns each block's
-last translation up to the phase end (the code the phase ran, wherever it
-was compiled) by code hash: the same code, different code, or compiled on
-one side only, with IR and machine-code sizes and compile time. With a
+`diff compile A B [--phase BEGIN:END] [--census RUNDIR]` compares, per block,
+the versions of its code that could run in the phase: the last translation
+before the phase began, then every one inside it, by code hash. The same
+versions in the same order are the same code; one version on each side that
+differs is different code; several versions whose sequences differ are
+*mixed*, since nothing records how much each version ran; and a block can be
+compiled on one side only. IR and machine-code sizes and compile time are
+shown for the last version. With a
 census run it weighs the blocks by the packets they executed in the phase
-and says how much of the work ran code that changed. Where `ab` says only
+and says how much of the work ran code that changed, how much ran unchanged
+code, and how much is unknown (mixed blocks). Both phase marks must be in
+the traces, the first before the second. Where `ab` says only
 whether the compile fingerprints are identical, this says which blocks a
 change reached and how much they ran; it says nothing about speed.
 

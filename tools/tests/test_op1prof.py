@@ -1097,7 +1097,9 @@ def test_first_mmr_access_report(tmp_path):
     _census(Path(f"{prefix}.mmio.b"), [(0xffc00800, 3, 1), (0xffc00c40, 0, 2)])
     Path(f"{prefix}.mmiofirst.b").write_bytes(census.FIRST.pack(0xffc00800, 0x100, 400, 900) +
                                               census.FIRST.pack(0xffc00c40, 0x200, 4_000_000, 4_000_000))
-    text = census.mmio_first_report(prefix, "a", "b", (1000, 5_000_000), 10, census.Symbols(None))
+    rows = census.mmio_first(prefix, "a", "b", (1000, 5_000_000))
+    assert [r["addr"] for r in rows] == [0xffc00c40] and rows[0]["writes"] == 2
+    text = census.mmio_first_report(rows, "a", "b", 10, census.Symbols(None))
     assert "first accessed a -> b: 1" in text           # 0xffc00800 was first touched before the phase
     assert "0xffc00c40     10.000          0          2 0x00000200" in text
 
@@ -1612,7 +1614,7 @@ def test_diff_compile_aligns_blocks_by_code_and_weighs_them_by_work(tmp_path, ca
     _compile_run(tmp_path / "A", [(0x100, "1" * 16, 10, 40), (0x200, "2" * 16, 20, 80), (0x400, "4" * 16, 5, 9)])
     _compile_run(tmp_path / "B", [(0x100, "1" * 16, 10, 40), (0x200, "9" * 16, 12, 50), (0x300, "3" * 16, 7, 9)])
     data = diff.compile_diff(tmp_path / "A", tmp_path / "B", ("a", "b"))
-    assert data["counts"] == {"same": 1, "changed": 1, "only a": 1, "only b": 1}
+    assert data["counts"] == {"same": 1, "changed": 1, "mixed": 0, "only a": 1, "only b": 1}
     weights = tmp_path / "W"
     weights.mkdir()
     _census(weights / "census.pc.a", [])
@@ -1648,3 +1650,74 @@ def test_ab_reports_each_phase_and_the_shape(files, tmp_path, capsys):
     printed = capsys.readouterr().out
     assert "shape at main-frame (base -> new): runs 1,000 -> 1,000" in printed
     assert "bootrom -> main-display" in printed and "+20.0%" in printed
+
+
+def _versioned_run(path, versions):
+    """A run whose block 0x100 is compiled once per (ts_us, hash) in
+    `versions`; marks a at 50 us and b at 1000 us."""
+    path.mkdir()
+    events = [_mark("a", 50, 0, 0), _mark("b", 1000, 0, 0)]
+    for ts, digest in versions:
+        events.append({**_translate(ts, 1, 1000), "args": {"pc": 0x100, "ok": True, "cpu_ns": 1000,
+                                                            "ir_insns": 5, "object_bytes": 9, "object_hash": digest}})
+    (path / "trace.json").write_text(json.dumps(_trace(sorted(events, key=lambda e: e["ts"]))))
+
+
+def test_diff_compile_does_not_call_recompiled_code_unchanged(tmp_path):
+    # Different code for most of the phase, then the same after a recompile:
+    # which version ran how much is unknown, so it is neither same nor changed.
+    _versioned_run(tmp_path / "A", [(10, "1" * 16), (500, "3" * 16)])
+    _versioned_run(tmp_path / "B", [(10, "2" * 16), (500, "3" * 16)])
+    weights = tmp_path / "W"
+    weights.mkdir()
+    _census(weights / "census.pc.a", [])
+    _census(weights / "census.pc.b", [(0x100, 10, 1000)])
+    data = diff.compile_diff(tmp_path / "A", tmp_path / "B", ("a", "b"), weights)
+    assert data["blocks"][0]["state"] == "mixed" and data["blocks"][0]["a"]["versions"] == 2
+    assert data["mixed_packets"] == 1000 and data["unchanged_packets"] == 0
+    assert "unknown (several versions that differ" in diff.compile_report(data, 5, census.Symbols(None))
+    # The same versions in the same order are the same code; a version
+    # replaced before the phase began never ran in it.
+    _versioned_run(tmp_path / "C", [(10, "9" * 16), (20, "1" * 16), (500, "3" * 16)])
+    assert diff.compile_diff(tmp_path / "A", tmp_path / "C", ("a", "b"))["blocks"][0]["state"] == "same"
+
+
+@pytest.mark.parametrize("phase,match", [(("nowhere", "b"), "not in the trace"), (("b", "a"), "empty"),
+                                         (("b", "b"), "empty")])
+def test_diff_compile_checks_its_phase(tmp_path, phase, match):
+    _versioned_run(tmp_path / "A", [(10, "1" * 16)])
+    with pytest.raises(ValueError, match=match):
+        diff.compile_diff(tmp_path / "A", tmp_path / "A", phase)
+
+
+def test_first_difference_follows_both_firing_orders():
+    def marks(*names):
+        return [parse_mark(f"[mark] {n} pc=0x0 wall_ms=0 cpu_ms=0 runs=1 packets=1 cycles=1 translated=0 "
+                           "mmio_r=0 mmio_w=0 events=0") for n in names]
+    found = diff.first_difference(marks("a", "b"), marks("a", "middle", "b"))
+    assert found["after"] == "a" and found["mark"] == "middle"
+    assert "A fired b and B fired middle" in found["lines"][0]
+    assert diff.first_difference(marks("a", "b"), marks("a"))["lines"] == ["after a, A fired b and B fired nothing"]
+    assert diff.first_difference(marks("a", "b"), marks("a", "b")) is None
+
+
+def test_ab_phase_delta_is_the_median_of_an_even_number_of_pairs():
+    pairs = [{"base": {"phases": [{"begin": "a", "end": "b", "noncompile_cpu_ms": 100.0, "compile_cpu_ms": 10.0}]},
+              "new": {"phases": [{"begin": "a", "end": "b", "noncompile_cpu_ms": 100.0 + d, "compile_cpu_ms": 10.0}]}}
+             for d in (-3000.0, -1000.0, 1000.0, 3000.0)]
+    assert ab._phase_deltas(pairs, 1)[0]["noncompile_cpu_ms"]["median_delta_ms"] == 0
+
+
+def test_mmio_first_json_has_the_records(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    prefix = run_dir / "census"
+    _census(Path(f"{prefix}.mmio.a"), [])
+    _census(Path(f"{prefix}.mmio.b"), [(0xffc00c40, 0, 2)])
+    Path(f"{prefix}.mmiofirst.b").write_bytes(census.FIRST.pack(0xffc00c40, 0x200, 4_000_000, 4_000_000))
+    (run_dir / "log.txt").write_text("\n".join(map(_mark_line, [{**_mark_entry("a", 1), "cycles": 1000},
+                                                                {**_mark_entry("b", 2), "cycles": 5_000_000}])))
+    out = tmp_path / "first.json"
+    assert cli.main(["census", str(run_dir), "--phase", "a:b", "--mmio-first", "--json", str(out)]) == 0
+    assert json.loads(out.read_text())["mmio_first"] == [
+        {"addr": 0xffc00c40, "first_cycles": 4_000_000, "first_block": 0x200, "reads": 0, "writes": 2}]

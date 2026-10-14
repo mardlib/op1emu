@@ -161,7 +161,9 @@ def cmd_census(args) -> int:
             if missing:
                 raise ValueError(f"marks did not fire in this run: {missing} (fired: {list(fired)})")
             window = (fired[begin].counters["cycles"], fired[end].counters["cycles"])
-            print(census.mmio_first_report(prefix, begin, end, window, args.top, symbols))
+            rows = census.mmio_first(prefix, begin, end, window)
+            print(census.mmio_first_report(rows, begin, end, args.top, symbols))
+            data["mmio_first"] = rows
         else:
             print(census.report(prefix, begin, end, args.top, symbols))
             data["blocks"] = [{"pc": pc, "runs": r, "packets": n} for pc, (r, n) in census.phase(prefix, "pc", begin, end).items()]

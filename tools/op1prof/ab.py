@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import statistics
 from dataclasses import asdict, dataclass, fields as dataclass_fields, replace
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -243,7 +244,7 @@ def _phase_deltas(pairs: List[dict], seed: int) -> List[dict]:
         for metric in ("noncompile_cpu_ms", "compile_cpu_ms"):
             base = [a[key][metric] for a, _ in sides]
             new = [b[key][metric] for _, b in sides]
-            delta_ms = sorted(n - b for b, n in zip(base, new))[len(base) // 2]
+            delta_ms = statistics.median(n - b for b, n in zip(base, new))
             if min(base) > 0:
                 comparison = stats.paired(base, new, seed=seed)
                 row[metric] = {"median_delta_ms": delta_ms, "mean_pct": comparison.mean_pct,

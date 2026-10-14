@@ -21,20 +21,24 @@ def _marks(run: Path) -> List[Mark]:
 
 
 def first_difference(a: List[Mark], b: List[Mark]) -> Optional[dict]:
-    """The first mark at which the two runs' guest work differs, in firing
-    order: the phase ending there is where they first did different work."""
-    b_by = {m.name: m for m in b}
+    """The first mark at which the two runs differ, both taken in firing
+    order: either another mark fired there, or the same mark with other
+    guest work. The phase ending there is where they first did different
+    work."""
     previous = "start"
-    for mark in a:
-        other = b_by.get(mark.name)
-        if other is None:
-            return {"mark": mark.name, "after": previous, "lines": [f"{mark.name} did not fire in B"]}
-        lines = workload_diff([mark], [other])
+    for index in range(max(len(a), len(b))):
+        x = a[index] if index < len(a) else None
+        y = b[index] if index < len(b) else None
+        if x is None or y is None or x.name != y.name:
+            fired_a = x.name if x else "nothing"
+            fired_b = y.name if y else "nothing"
+            return {"mark": y.name if y else x.name, "after": previous,
+                    "lines": [f"after {previous}, A fired {fired_a} and B fired {fired_b}"]}
+        lines = workload_diff([x], [y])
         if lines:
-            return {"mark": mark.name, "after": previous, "lines": lines}
-        previous = mark.name
-    extra = [m.name for m in b if m.name not in {x.name for x in a}]
-    return {"mark": extra[0], "after": previous, "lines": [f"{extra[0]} did not fire in A"]} if extra else None
+            return {"mark": x.name, "after": previous, "lines": lines}
+        previous = x.name
+    return None
 
 
 def _delta_rows(a: Dict[int, Tuple[int, int]], b: Dict[int, Tuple[int, int]]) -> List[dict]:
@@ -126,47 +130,71 @@ def census_report(data: dict, limit: int, symbols: census.Symbols) -> str:
     return "\n".join(lines)
 
 
-def _last_translation(trace_data: dict, end: Optional[str]) -> Dict[int, compilation.Translation]:
-    """The last successful translation of each block before mark `end` (or
-    in the whole run): the code that ran last."""
-    stop = float("inf")
-    if end:
-        found = trace.marks(trace_data)
-        if end not in found:
-            raise trace.TraceError(f"mark {end!r} is not in the trace")
-        stop = found[end]["ts"]
-    out = {}
+def _bounds(trace_data: dict, window: Optional[Tuple[str, str]]) -> Tuple[float, float]:
+    if not window:
+        return float("-inf"), float("inf")
+    found = trace.marks(trace_data)
+    for name in window:
+        if name not in found:
+            raise trace.TraceError(f"mark {name!r} is not in the trace")
+    lo, hi = found[window[0]]["ts"], found[window[1]]["ts"]
+    if lo >= hi:
+        raise ValueError(f"phase {window[0]}:{window[1]} is empty: {window[0]} does not come before {window[1]}")
+    return lo, hi
+
+
+def _versions(trace_data: dict, window: Optional[Tuple[str, str]]) -> Dict[int, List[compilation.Translation]]:
+    """Per block, the code that could have run in the phase, in order: the
+    last successful translation before it began, then every one inside it.
+    A block compiled more than once there ran several versions, and nothing
+    says how much each ran."""
+    lo, hi = _bounds(trace_data, window)
+    out: Dict[int, List[compilation.Translation]] = {}
     for t in sorted(compilation.translations(trace_data), key=lambda t: t.begin_us):
-        if t.ok and t.begin_us < stop:
-            out[t.pc] = t
+        if not t.ok or t.begin_us >= hi:
+            continue
+        if t.begin_us < lo:
+            out[t.pc] = [t]       # an earlier version replaced before the phase
+        else:
+            out.setdefault(t.pc, []).append(t)
     return out
 
 
 def compile_diff(run_a: Path, run_b: Path, window: Optional[Tuple[str, str]],
                  weights: Optional[Path] = None) -> dict:
-    """Blocks whose machine code differs between two runs (by the code hash
-    of their last translation before the phase ends), those compiled on one
-    side only, and with a census run, how much of the phase's executed work
-    the changed code covers."""
-    # The code a phase ran was compiled any time before its end, not only
-    # inside it: take each block's last translation up to the end.
-    end = window[1] if window else None
-    ta, tb = (_last_translation(trace.load(str(r / "trace.json")), end) for r in (run_a, run_b))
-    for side, spans in (("A", ta), ("B", tb)):
-        if spans and not compilation.has_shape(list(spans.values())):
+    """Blocks whose machine code differs between two runs: by the code hashes
+    of the versions that could run in the phase (the last before it, then
+    every translation inside it), those compiled on one side only, and with
+    a census run, how much of the phase's executed work the changed code
+    covers. A block with several versions on a side whose sequences differ
+    is "mixed": its packets cannot be split between versions."""
+    va, vb = (_versions(trace.load(str(r / "trace.json")), window) for r in (run_a, run_b))
+    for side, versions in (("A", va), ("B", vb)):
+        spans = [t for ts in versions.values() for t in ts]
+        if spans and not compilation.has_shape(spans):
             raise ValueError(f"run {side} has no code hashes (a binary before them): nothing to compare")
     blocks = []
-    for pc in set(ta) | set(tb):
-        a, b = ta.get(pc), tb.get(pc)
-        state = "only a" if b is None else "only b" if a is None else \
-            "same" if a.object_hash == b.object_hash else "changed"
-        blocks.append({"pc": pc, "state": state,
-                       "a": {"ir_insns": a.ir_insns, "object_bytes": a.object_bytes, "cpu_ns": a.cpu_ns} if a else None,
-                       "b": {"ir_insns": b.ir_insns, "object_bytes": b.object_bytes, "cpu_ns": b.cpu_ns} if b else None})
+    for pc in set(va) | set(vb):
+        a, b = va.get(pc), vb.get(pc)
+        if a is None or b is None:
+            state = "only a" if b is None else "only b"
+        elif [t.object_hash for t in a] == [t.object_hash for t in b]:
+            state = "same"
+        elif len(a) == 1 and len(b) == 1:
+            state = "changed"
+        else:
+            state = "mixed"
+        def describe(ts):
+            if not ts:
+                return None
+            last = ts[-1]
+            return {"ir_insns": last.ir_insns, "object_bytes": last.object_bytes, "cpu_ns": last.cpu_ns,
+                    "versions": len(ts)}
+        blocks.append({"pc": pc, "state": state, "a": describe(a), "b": describe(b)})
     out = {"schema": SCHEMA, "kind": "compile", "window": list(window) if window else None,
            "a": str(run_a), "b": str(run_b), "blocks": blocks,
            "counts": {state: sum(1 for b in blocks if b["state"] == state)
-                      for state in ("same", "changed", "only a", "only b")}}
+                      for state in ("same", "changed", "mixed", "only a", "only b")}}
     if weights:
         if not window:
             raise ValueError("--census weighs blocks by a phase's work: give --phase")
@@ -177,8 +205,9 @@ def compile_diff(run_a: Path, run_b: Path, window: Optional[Tuple[str, str]],
             b["runs"], b["packets"] = runs, packets
         out["weights"] = str(weights)
         out["packets_total"] = total
-        out["changed_packets"] = sum(b["packets"] for b in blocks if b["state"] == "changed")
-        out["unchanged_packets"] = sum(b["packets"] for b in blocks if b["state"] == "same")
+        for state, key in (("changed", "changed_packets"), ("same", "unchanged_packets"),
+                           ("mixed", "mixed_packets")):
+            out[key] = sum(b["packets"] for b in blocks if b["state"] == state)
         out["one_side_packets"] = sum(b["packets"] for b in blocks if b["state"].startswith("only"))
     return out
 
@@ -187,16 +216,17 @@ def compile_report(data: dict, limit: int, symbols: census.Symbols) -> str:
     c = data["counts"]
     where = f" {data['window'][0]} -> {data['window'][1]}" if data["window"] else ""
     lines = [f"compile diff{where}: A {data['a']}, B {data['b']}",
-             f"blocks with the same code {c['same']:,}, different code {c['changed']:,}, compiled only in A "
-             f"{c['only a']:,}, only in B {c['only b']:,}"]
+             f"blocks with the same code {c['same']:,}, different code {c['changed']:,}, several versions that "
+             f"differ {c['mixed']:,}, compiled only in A {c['only a']:,}, only in B {c['only b']:,}"]
     weighted = "packets_total" in data
     if weighted:
         total = data["packets_total"]
         lines.append(f"weighted by the census {data['weights']}: blocks whose code changed executed "
                      f"{data['changed_packets'] / total * 100:.1f}% of the phase's packets, unchanged ones "
                      f"{data['unchanged_packets'] / total * 100:.1f}%, compiled on one side only "
-                     f"{data['one_side_packets'] / total * 100:.1f}%")
-    changed = [b for b in data["blocks"] if b["state"] == "changed"]
+                     f"{data['one_side_packets'] / total * 100:.1f}%, unknown (several versions that differ, which "
+                     f"ran how much is not recorded) {data['mixed_packets'] / total * 100:.1f}%")
+    changed = [b for b in data["blocks"] if b["state"] in ("changed", "mixed")]
     key = (lambda b: -b["packets"]) if weighted else (lambda b: -abs(b["b"]["object_bytes"] - b["a"]["object_bytes"]))
     if changed:
         lines += ["", f"{'block':>10} {'IR A':>7} {'IR B':>7} {'bytes A':>8} {'bytes B':>8} {'ms A':>7} {'ms B':>7}"
@@ -207,7 +237,9 @@ def compile_report(data: dict, limit: int, symbols: census.Symbols) -> str:
                    f"{b['a']['cpu_ns'] / 1e6:7.2f} {b['b']['cpu_ns'] / 1e6:7.2f}")
             if weighted:
                 row += f" {b['packets']:>13,} {b['packets'] / data['packets_total'] * 100:5.1f}%"
-            lines.append(row + f"  {symbols.name(b['pc'])}")
+            versions = "" if b["state"] == "changed" else \
+                f"  ({b['a']['versions']} vs {b['b']['versions']} versions; sizes of the last)"
+            lines.append(row + f"  {symbols.name(b['pc'])}{versions}")
     for side in ("a", "b"):
         only = [b for b in data["blocks"] if b["state"] == f"only {side}"]
         if only:
