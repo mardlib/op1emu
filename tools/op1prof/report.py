@@ -136,6 +136,22 @@ def _merged(spans: Iterable[Tuple[int, int]]) -> List[Tuple[int, int]]:
     return out
 
 
+# DSO names that differ between runs of the same code: op1prof's binary
+# snapshot (op1emu-<content hash>) and perf inject's jitted-<pid>-<n>.so.
+SNAPSHOT_DSO = re.compile(r"^op1emu-[0-9a-f]{12}$")
+JITTED_DSO = re.compile(r"^jitted-\d+-\d+\.so$")
+
+
+def dso_label(dso: str) -> str:
+    """A DSO as a row label: the same name in every capture of every binary,
+    so one function compares with itself."""
+    if SNAPSHOT_DSO.match(dso):
+        return "op1emu"
+    if JITTED_DSO.match(dso):
+        return "jitted"
+    return dso
+
+
 def attribute(samples: Iterable[Sample], trace_data: dict, window: Tuple[str, str], categories: Categories,
               labels: Labels, callers_of: Optional[str] = None) -> Attribution:
     """Weight every CPU-thread sample inside the window and outside
@@ -173,7 +189,7 @@ def _execution(out: Attribution, sample: Sample, categories: Categories, labels:
     if leaf_pc is not None:
         out.self_blocks[labels(leaf_pc)] += weight
     elif sample.frames:
-        out.self_symbols[f"{sample.frames[0][0]} ({sample.frames[0][1]})"] += weight
+        out.self_symbols[f"{sample.frames[0][0]} ({dso_label(sample.frames[0][1])})"] += weight
     # A block's inclusive time covers what it calls (memory callbacks,
     # devices reached through them); one block per stack in this engine.
     block = next((pc for pc in map(block_pc, symbols) if pc is not None), None)

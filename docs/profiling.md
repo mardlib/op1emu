@@ -664,7 +664,10 @@ its window marks did not both fire or the marks fired out of file order),
 then `perf inject --jit`. It checks first that perf may
 record the event; it never changes `kernel.perf_event_paranoid` but says what
 to set (2 is enough). Every capture records perf's own counts of samples,
-lost samples and throttling (`perf report --stats`) in `capture.json`, and
+lost samples and throttling in `capture.json` (samples from `perf report
+--stats`; lost samples and throttling from the records in `perf report -D`,
+since `--stats` counts records and one record can stand for hundreds of
+lost samples; reading them takes about 17 s for a boot's 200k samples), and
 `report` warns when more than 1% of the sample records were lost or perf
 throttled the rate: the tables then under-sample those stretches. For older
 captures it reads them from `perf.data`.
@@ -676,10 +679,16 @@ them) gives every bucket, block and host symbol as a mean over them with a
 2.5% between capture sets in the research line and a baseline's by 11%,
 tenfold what Poisson noise on the sample counts suggests: the interval
 comes from the captures, never from sample counts. The captures must be
-one run in all but timing (the same check as `report --census`).
+one run in all but timing (the same check as `report --census`), each
+given once (a capture listed twice, or with its parent directory, would
+narrow the interval for nothing), and each with execution samples in its
+window: a window too short for the sampling period has none, and its rows
+would read as zero time rather than unknown.
 
 `diff report A B` compares two sets (each a capture or a directory of them)
-of the same window and event: per bucket, block and symbol, the mean
+of the same window and event, no capture on both sides: per bucket, block
+and symbol (the binary snapshot and the jitted code are one DSO name in
+every capture, so a function of two binaries is one row), the mean
 seconds of each, their difference and, with three or more captures a side,
 a 95% Welch interval of it. It says where the time went differently, not
 whether the total changed (that is `ab`'s verdict). `ab --perf N` takes N

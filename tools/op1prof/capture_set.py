@@ -52,7 +52,19 @@ def _interval(values: Sequence[float]) -> Optional[Tuple[float, float]]:
 def load(captures: List[Path], categories: Categories, labels: perf_report.Labels) -> List[dict]:
     """Analyze each capture; all must be one configuration in all but timing:
     the same window and event, and the same run (perf_report.check_same_run)."""
+    seen = {}
+    for capture in captures:
+        real = capture.resolve()
+        if real in seen:
+            raise ValueError(f"{capture} is given twice (also as {seen[real]}): a capture counted twice is not a "
+                             "repeat, and its interval would be too narrow")
+        seen[real] = capture
     reports = [perf_report.analyze(c, categories, labels) for c in captures]
+    for capture, report in zip(captures, reports):
+        if not report["samples"].get("execution", {}).get("count"):
+            # Every row would read as zero: an estimate of nothing, not of no time.
+            raise ValueError(f"{capture}: no execution samples in the window (too short for the sampling period): "
+                             "its time cannot be estimated; capture a longer window or sample more often")
     first = reports[0]
     for capture, report in zip(captures[1:], reports[1:]):
         for field in ("window", "event", "rate", "call_graph"):
@@ -138,6 +150,9 @@ def _welch(a: Sequence[float], b: Sequence[float]) -> Optional[Tuple[float, floa
 def diff_sets(a_captures: List[Path], a: List[dict], b_captures: List[Path], b: List[dict]) -> dict:
     """Per row, the mean seconds of each set, their difference and, with three
     or more captures a side, a 95% Welch interval of it."""
+    overlap = {c.resolve() for c in a_captures} & {c.resolve() for c in b_captures}
+    if overlap:
+        raise ValueError(f"captures on both sides: {sorted(map(str, overlap))[:3]}")
     for field in ("window", "event", "rate", "call_graph"):
         if a[0][field] != b[0][field]:
             raise ValueError(f"the sets differ in {field}: {a[0][field]} vs {b[0][field]}; capture both alike")

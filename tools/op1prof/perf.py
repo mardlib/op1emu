@@ -7,7 +7,7 @@ import re
 import subprocess
 from dataclasses import replace
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 from . import marks
 from .runner import RunResult, RunSpec, run
@@ -115,23 +115,40 @@ def preflight(event: str, rate: List[str], call_graph: str = "fp") -> Optional[s
 
 # Lost samples a report should not hide: above this share they bias every table.
 MAX_LOST = 0.01
-STATS_LINE = re.compile(r"^\s*(?P<kind>[A-Z_]+) events:\s*(?P<count>\d+)")
+SAMPLES_LINE = re.compile(r"^\s*SAMPLE events:\s*(?P<count>\d+)")
+# From `perf report -D`: the records themselves carry how many samples were
+# lost; `--stats` counts records, so one record of 261 lost samples reads 1.
+LOST_RECORD = re.compile(r"PERF_RECORD_LOST: .*lost:(?P<lost>\d+)")
+LOST_SAMPLES_RECORD = re.compile(r"PERF_RECORD_LOST_SAMPLES: .*lost samples\s*:(?P<lost>\d+)")
+THROTTLE_RECORD = re.compile(r"PERF_RECORD_THROTTLE\b")
 
 
-def parse_record_stats(lines: List[str]) -> dict:
-    """`perf report --stats`: samples, records of lost samples and of
-    throttling (perf lowering the rate because the handler took too long)."""
-    counts = {}
-    for line in lines:
-        match = STATS_LINE.match(line)
-        if match and match.group("kind") not in counts:
-            counts[match.group("kind")] = int(match.group("count"))
-    samples, lost = counts.get("SAMPLE", 0), counts.get("LOST", 0) + counts.get("LOST_SAMPLES", 0)
-    throttled = counts.get("THROTTLE", 0)
+def parse_record_stats(stats_lines: List[str], dump_lines: Iterable[str]) -> dict:
+    """Samples (from `perf report --stats`), samples lost and throttling
+    (perf lowering the rate because the handler took too long), from the
+    records of `perf report -D`. perf writes one LOST record per overflow of
+    its buffer and, at the end, one LOST_SAMPLES record per event summing
+    them: count the summaries when there are any, else the overflows, never
+    both."""
+    samples = 0
+    for line in stats_lines:
+        match = SAMPLES_LINE.match(line)
+        if match:
+            samples = int(match.group("count"))
+            break
+    overflows, summaries, throttled = 0, None, 0
+    for line in dump_lines:
+        if (match := LOST_SAMPLES_RECORD.search(line)):
+            summaries = (summaries or 0) + int(match.group("lost"))
+        elif (match := LOST_RECORD.search(line)):
+            overflows += int(match.group("lost"))
+        elif THROTTLE_RECORD.search(line):
+            throttled += 1
+    lost = summaries if summaries is not None else overflows
     out = {"samples": samples, "lost": lost, "throttle": throttled, "warning": None}
     problems = []
     if samples + lost and lost / (samples + lost) > MAX_LOST:
-        problems.append(f"{lost} of {samples + lost} sample records lost ({lost / (samples + lost):.1%})")
+        problems.append(f"{lost} of {samples + lost} samples lost ({lost / (samples + lost):.1%})")
     if throttled:
         problems.append(f"perf throttled the sampling {throttled} times (its rate fell below the one asked for)")
     if problems:
@@ -144,7 +161,17 @@ def record_stats(data: Path) -> dict:
     if stats.returncode != 0:
         return {"samples": None, "lost": None, "throttle": None,
                 "warning": f"perf report --stats failed: {stats.stderr.strip()[-200:]}"}
-    return parse_record_stats(stats.stdout.splitlines())
+    # Streamed: a raw dump of a long capture is large.
+    dump = subprocess.Popen(["perf", "report", "-D", "-i", str(data)], stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True, errors="replace")
+    try:
+        out = parse_record_stats(stats.stdout.splitlines(), dump.stdout)
+    finally:
+        dump.stdout.close()
+        dump.wait()
+    if dump.returncode != 0:
+        out["warning"] = (out["warning"] + "; " if out["warning"] else "") + "perf report -D failed: lost samples unknown"
+    return out
 
 
 def record(spec: RunSpec, directory: Path, window: Tuple[str, str], event: str,
