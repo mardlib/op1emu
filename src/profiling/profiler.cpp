@@ -359,8 +359,12 @@ struct Profiler::Impl : BcoreEventSink {
         if (ReadCounters(values)) translateInsnsBegin = values.instructions;
         translateBegin = MonotonicNs();
         translateCpuBegin = ThreadCpuNs();
+        if (memory) memory->paused = true;
     }
     void Translated(uint32_t pc, bool ok) {
+        // After a failed translation too: bcore reports the failure before
+        // the exception leaves Core::run.
+        if (memory) memory->paused = false;
         Event event;
         event.name = "translate";
         event.begin = translateBegin;
@@ -458,7 +462,9 @@ struct Profiler::Impl : BcoreEventSink {
         startWall = MonotonicNs();
         startCpu = ThreadCpuNs();
         startProcessCpu = ProcessCpuNs();
-        if (!events.empty() || !options.dumpIrPcs.empty()) cpu.SetCoreEventSink(this);
+        // The census needs the translation brackets to leave instruction
+        // fetches out of the guest's memory accesses.
+        if (!events.empty() || !options.dumpIrPcs.empty() || census) cpu.SetCoreEventSink(this);
         if (options.jitdump) cpu.SetPerfJitdump(true);
         Fire("start", pc);
     }

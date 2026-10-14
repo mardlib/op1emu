@@ -218,7 +218,10 @@ counts in the phase of the block it ends.
 `PREFIX.memory.MARK` (JSON, `op1.memory.v1`) counts the guest's loads and
 stores by device and width (8, 16, 32 bits), found the way the emulator
 finds the device, with `unmapped` for addresses no device maps. Every one
-of them is a call from generated code into the host in op1emu.
+of them is a call from generated code into the host in op1emu. bcore reads
+a block's instructions through the same interface while it translates the
+block; those reads are compilation, once per translation, and the census
+leaves them out (a stock boot's 21,631 translations fetched 263,295 times).
 
 On a stock boot between `main-boot` and `main-display`, 338,146,940 of
 340,049,495 block runs (99.4%) needed nothing from the host: 1,640,665 had
@@ -226,7 +229,7 @@ accessed an MMR, 197,166 were followed by host work the guest could see,
 64,724 both. 266M of the runs end in a jump and 99.8% of those needed
 nothing; the FIR loop block 0x01a5e27e alone ran 239,186,304 times, needed
 the host 27,817 times, and went on to itself 98.4% of the time. The guest
-made 832,069,596 loads and stores: 67.9% to SDRAM, 31.0% to L1 data bank A
+made 831,806,301 loads and stores: 67.9% to SDRAM, 31.0% to L1 data bank A
 (mostly 16-bit reads), and the FIR block made 58% of them, two per run.
 
 ### Service census

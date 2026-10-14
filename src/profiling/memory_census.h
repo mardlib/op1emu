@@ -26,12 +26,17 @@ struct MemoryCensus {
 
     std::vector<Region> regions;  // the devices in binding order, then "unmapped"
     uint64_t accesses = 0;        // every access so far (per-block counts difference it)
+    // Set while bcore translates a block: it fetches the instructions through
+    // the same Memory interface, and those reads are compilation, not guest
+    // loads (they happen once per translation, not once per run).
+    bool paused = false;
 
     // The same lookup as the emulator's: a map keyed by every device's base
     // and end address, first binding wins, the first key at or above the
     // address, and the device must contain it.
     void SetDevices(const std::vector<DeviceRange>& devices);
     void Count(uint32_t addr, int widthIndex, bool write) {
+        if (paused) return;
         ++accesses;
         auto it = keys_.lower_bound(addr);
         Region* region = &regions.back();
