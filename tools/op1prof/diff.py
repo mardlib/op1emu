@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from . import census, compilation, exits, service, trace
-from .marks import Mark, parse_marks, workload_diff
+from .marks import Mark, optional_absent, parse_marks, workload_diff
 
 SCHEMA = "op1prof.diff.v1"
 
@@ -25,6 +25,9 @@ def first_difference(a: List[Mark], b: List[Mark]) -> Optional[dict]:
     order: either another mark fired there, or the same mark with other
     guest work. The phase ending there is where they first did different
     work."""
+    # Counters an older binary lacks, decided over the whole runs: a counter
+    # one side reports at some marks and not at others is a difference.
+    skipped = optional_absent(a, b)
     previous = "start"
     for index in range(max(len(a), len(b))):
         x = a[index] if index < len(a) else None
@@ -34,7 +37,7 @@ def first_difference(a: List[Mark], b: List[Mark]) -> Optional[dict]:
             fired_b = y.name if y else "nothing"
             return {"mark": y.name if y else x.name, "after": previous,
                     "lines": [f"after {previous}, A fired {fired_a} and B fired {fired_b}"]}
-        lines = workload_diff([x], [y])
+        lines = workload_diff([x], [y], skipped)
         if lines:
             return {"mark": x.name, "after": previous, "lines": lines}
         previous = x.name
@@ -160,6 +163,15 @@ def _versions(trace_data: dict, window: Optional[Tuple[str, str]]) -> Dict[int, 
     return out
 
 
+def _distinct(versions: List[compilation.Translation]) -> List[str]:
+    """The code hashes in order, a run of identical ones counted once."""
+    out: List[str] = []
+    for t in versions:
+        if not out or out[-1] != t.object_hash:
+            out.append(t.object_hash)
+    return out
+
+
 def compile_diff(run_a: Path, run_b: Path, window: Optional[Tuple[str, str]],
                  weights: Optional[Path] = None) -> dict:
     """Blocks whose machine code differs between two runs: by the code hashes
@@ -178,18 +190,22 @@ def compile_diff(run_a: Path, run_b: Path, window: Optional[Tuple[str, str]],
         a, b = va.get(pc), vb.get(pc)
         if a is None or b is None:
             state = "only a" if b is None else "only b"
-        elif [t.object_hash for t in a] == [t.object_hash for t in b]:
-            state = "same"
-        elif len(a) == 1 and len(b) == 1:
-            state = "changed"
         else:
-            state = "mixed"
+            # Versions of the code, not compilations: compiling the same
+            # machine code again is one version.
+            ca, cb = _distinct(a), _distinct(b)
+            if ca == cb:
+                state = "same"
+            elif len(ca) == 1 and len(cb) == 1:
+                state = "changed"
+            else:
+                state = "mixed"
         def describe(ts):
             if not ts:
                 return None
             last = ts[-1]
             return {"ir_insns": last.ir_insns, "object_bytes": last.object_bytes, "cpu_ns": last.cpu_ns,
-                    "versions": len(ts)}
+                    "compilations": len(ts), "versions": len(_distinct(ts))}
         blocks.append({"pc": pc, "state": state, "a": describe(a), "b": describe(b)})
     out = {"schema": SCHEMA, "kind": "compile", "window": list(window) if window else None,
            "a": str(run_a), "b": str(run_b), "blocks": blocks,

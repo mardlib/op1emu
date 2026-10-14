@@ -1721,3 +1721,33 @@ def test_mmio_first_json_has_the_records(tmp_path):
     assert cli.main(["census", str(run_dir), "--phase", "a:b", "--mmio-first", "--json", str(out)]) == 0
     assert json.loads(out.read_text())["mmio_first"] == [
         {"addr": 0xffc00c40, "first_cycles": 4_000_000, "first_block": 0x200, "reads": 0, "writes": 2}]
+
+
+@pytest.mark.parametrize("a,b,state", [
+    ([(10, "1" * 16), (500, "1" * 16)], [(10, "1" * 16)], "same"),                      # the same code compiled again
+    ([(10, "1" * 16), (500, "1" * 16)], [(10, "2" * 16), (600, "2" * 16)], "changed"),  # one version a side
+    ([(10, "1" * 16), (500, "3" * 16)], [(10, "1" * 16), (500, "1" * 16), (600, "3" * 16)], "same"),
+])
+def test_diff_compile_counts_versions_of_code_not_compilations(tmp_path, a, b, state):
+    _versioned_run(tmp_path / "A", a)
+    _versioned_run(tmp_path / "B", b)
+    weights = tmp_path / "W"
+    weights.mkdir()
+    _census(weights / "census.pc.a", [])
+    _census(weights / "census.pc.b", [(0x100, 10, 1000)])
+    data = diff.compile_diff(tmp_path / "A", tmp_path / "B", ("a", "b"), weights)
+    assert data["blocks"][0]["state"] == state and data["mixed_packets"] == 0
+
+
+def test_first_difference_judges_a_missing_counter_over_the_whole_runs():
+    def mark(name, irq):
+        return parse_mark(f"[mark] {name} pc=0x0 wall_ms=0 cpu_ms=0 runs=1 packets=1 cycles=1 translated=0 "
+                          f"mmio_r=0 mmio_w=0 events=0{irq}")
+    a = [mark("a", " irq=0"), mark("b", " irq=1")]
+    b = [mark("a", " irq=0"), mark("b", "")]
+    found = diff.first_difference(a, b)
+    assert found["mark"] == "b" and any("irq: missing" in line for line in found["lines"])
+    # A binary without the counter at all is still compared on the rest.
+    older = [mark("a", ""), mark("b", "")]
+    assert diff.first_difference(older, [mark("a", ""), mark("b", "")]) is None
+    assert diff.first_difference([mark("a", " irq=0"), mark("b", " irq=1")], older) is None

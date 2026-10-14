@@ -615,7 +615,8 @@ does. One whose method cannot be found is shown as `?`, never as a zero. It need
 `diff census A B --phase BEGIN:END` compares two census runs: total block
 runs, packets and MMR accesses; the first mark at which their guest work
 differs (both runs in firing order: a mark that fired on one side only is a
-difference there too); the blocks that gained or lost the most packets, and those that
+difference there too, and a counter one run reports at some marks but not
+at others is one, while a counter a binary lacks everywhere is left out); the blocks that gained or lost the most packets, and those that
 ran on one side only; the MMRs whose accesses changed; and, when both runs
 have them, the service and exit censuses. Blocks that ran a different
 number of times for the same packets were formed differently. With
@@ -626,11 +627,12 @@ guest memory accesses.
 
 `diff compile A B [--phase BEGIN:END] [--census RUNDIR]` compares, per block,
 the versions of its code that could run in the phase: the last translation
-before the phase began, then every one inside it, by code hash. The same
-versions in the same order are the same code; one version on each side that
-differs is different code; several versions whose sequences differ are
-*mixed*, since nothing records how much each version ran; and a block can be
-compiled on one side only. IR and machine-code sizes and compile time are
+before the phase began, then every one inside it, by code hash. A version
+is distinct code, not a compilation: compiling the same machine code again
+adds none. The same versions in the same order are the same code; one
+version on each side that differs is different code; several versions whose
+sequences differ are *mixed*, since nothing records how much each version
+ran; and a block can be compiled on one side only. IR and machine-code sizes and compile time are
 shown for the last version. With a
 census run it weighs the blocks by the packets they executed in the phase
 and says how much of the work ran code that changed, how much ran unchanged
