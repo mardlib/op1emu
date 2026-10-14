@@ -113,6 +113,40 @@ def preflight(event: str, rate: List[str], call_graph: str = "fp") -> Optional[s
     return message
 
 
+# Lost samples a report should not hide: above this share they bias every table.
+MAX_LOST = 0.01
+STATS_LINE = re.compile(r"^\s*(?P<kind>[A-Z_]+) events:\s*(?P<count>\d+)")
+
+
+def parse_record_stats(lines: List[str]) -> dict:
+    """`perf report --stats`: samples, records of lost samples and of
+    throttling (perf lowering the rate because the handler took too long)."""
+    counts = {}
+    for line in lines:
+        match = STATS_LINE.match(line)
+        if match and match.group("kind") not in counts:
+            counts[match.group("kind")] = int(match.group("count"))
+    samples, lost = counts.get("SAMPLE", 0), counts.get("LOST", 0) + counts.get("LOST_SAMPLES", 0)
+    throttled = counts.get("THROTTLE", 0)
+    out = {"samples": samples, "lost": lost, "throttle": throttled, "warning": None}
+    problems = []
+    if samples + lost and lost / (samples + lost) > MAX_LOST:
+        problems.append(f"{lost} of {samples + lost} sample records lost ({lost / (samples + lost):.1%})")
+    if throttled:
+        problems.append(f"perf throttled the sampling {throttled} times (its rate fell below the one asked for)")
+    if problems:
+        out["warning"] = "; ".join(problems) + ": the tables under-sample those stretches"
+    return out
+
+
+def record_stats(data: Path) -> dict:
+    stats = subprocess.run(["perf", "report", "--stats", "-i", str(data)], capture_output=True, text=True)
+    if stats.returncode != 0:
+        return {"samples": None, "lost": None, "throttle": None,
+                "warning": f"perf report --stats failed: {stats.stderr.strip()[-200:]}"}
+    return parse_record_stats(stats.stdout.splitlines())
+
+
 def record(spec: RunSpec, directory: Path, window: Tuple[str, str], event: str,
            period: Optional[int], freq: Optional[int], call_graph: str = "fp") -> RunResult:
     """Run under perf with sampling enabled only between two marks."""
@@ -132,8 +166,9 @@ def record(spec: RunSpec, directory: Path, window: Tuple[str, str], event: str,
                                  "-o", str(directory / "perf.jit.data")], capture_output=True, text=True)
         if inject.returncode != 0:
             result.error = f"perf inject failed: {inject.stderr.strip()[-300:]}"
+    stats = record_stats(directory / "perf.data") if (directory / "perf.data").is_file() else None
     (directory / "capture.json").write_text(json.dumps(
         {"event": event, "precise": is_precise(event), "rate": rate, "call_graph": call_graph,
-         "window": list(window),
+         "window": list(window), "record": stats,
          "run": result.to_json()}, indent=1))
     return result

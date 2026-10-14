@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
-from . import census, exits, trace
+from . import census, exits, perf, trace
 from .perf import is_software_event
 from .categories import Categories
 from .marks import Mark, workload_diff
@@ -301,6 +301,9 @@ def analyze(capture: Path, categories: Categories, labels: Labels, callers_of: O
     data = {
         "schema": SCHEMA, "event": event, "precise": info["precise"], "rate": info["rate"],
         "call_graph": info.get("call_graph", "fp"),
+        # Captures before the check have none in capture.json: read it now.
+        "record": info.get("record") or (perf.record_stats(capture / "perf.data")
+                                         if (capture / "perf.data").is_file() else None),
         "window": list(window),
         "samples": {fate: {"count": result.counts[fate], "weight": result.weights[fate]} for fate in result.counts},
         "execution_cpu_s": phase.noncompile_cpu_ms / 1e3, "compile_cpu_s": phase.compile_cpu_ms / 1e3,
@@ -348,7 +351,7 @@ def _table(title: str, rows: List[dict], key: str, limit: int, width: int = 60) 
     return lines
 
 
-def format_report(data: dict, limit: int, sort: str = "seconds") -> str:
+def format_report(data: dict, limit: int, sort: str = "seconds", min_runs: int = 1000) -> str:
     window = data["window"]
     lines = [f"perf {data['event']} {' '.join(data['rate'])} --call-graph {data['call_graph']}, "
              f"window {window[0]} -> {window[1]}",
@@ -357,6 +360,9 @@ def format_report(data: dict, limit: int, sort: str = "seconds") -> str:
              "seconds below are execution CPU split by sampled weight",
              f"generated code (self) {data['generated_code_pct']:.1f}% of execution",
              "Shares are where samples landed, not what removing that code would save."]
+    record = data.get("record")
+    if record and record.get("warning"):
+        lines.append(f"warning: {record['warning']}")
     if data["sampled_over_trace"] is not None:
         lines.append(f"sampled CPU / trace execution CPU = {data['sampled_over_trace']:.3f}")
     if not data["precise"]:
@@ -378,18 +384,27 @@ def format_report(data: dict, limit: int, sort: str = "seconds") -> str:
     if "callers" in data:
         lines += _table(f"callers of {data['callers']['of']}", data["callers"]["rows"], "caller", limit)
     if "census" in data:
-        lines += _census_lines(data["census"], limit, sort)
+        lines += _census_lines(data["census"], limit, sort, min_runs)
     return "\n".join(lines)
 
 
-def _census_lines(joined: dict, limit: int, sort: str) -> List[str]:
+def _census_lines(joined: dict, limit: int, sort: str, min_runs: int = 1000) -> List[str]:
     key = {"seconds": "seconds", "ns-per-run": "ns_per_run", "ns-per-packet": "ns_per_packet"}[sort]
-    rows = sorted(joined["blocks"], key=lambda row: -row[key])
+    rows = joined["blocks"]
+    left_out = 0
+    if key != "seconds":
+        # A block that ran a few times has a few samples: its cost per run is
+        # chance, and dividing by a small count puts it on top.
+        kept = [row for row in rows if row["runs"] >= min_runs]
+        left_out, rows = len(rows) - len(kept), kept
+    rows = sorted(rows, key=lambda row: -row[key])
     lines = ["", f"census join over {joined['runs']} runs: sampled estimates, not exact costs; "
                  "their error comes from repeated captures, not from sample counts",
              f"outside guest blocks (dispatch, devices, event queue, CPU loop): "
              f"{joined['outside_blocks_s']:.3f} s = {joined['outside_blocks_ns_per_run']:.1f} ns per run; "
              f"sampled in blocks the census did not run: {joined['sampled_not_in_census_s']:.3f} s",
+             *([f"{left_out} blocks that ran fewer than {min_runs} times are left out of this order (--min-runs)"]
+               if left_out else []),
              f"{'guest block':40s} {'runs':>12} {'packets':>13} {'seconds':>9} {'ns/run':>8} {'ns/pkt':>7}"
              + (f" {'acc/run':>8} {'ns/acc':>7}" if rows and "accesses_per_run" in rows[0] else "")]
     for row in rows[:limit]:
