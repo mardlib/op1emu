@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <atomic>
+#include <typeinfo>
 #include "emu.h"
 #include <utils/log.h>
 
 Emulator::Emulator()
+    : directPages(NUM_PAGE_TABLE_ENTRIES, nullptr)
 {
     pageTable = std::make_shared<std::array<u8*, NUM_PAGE_TABLE_ENTRIES>>();
 }
@@ -15,6 +17,7 @@ void Emulator::BindDevice(Device* dev)
     deviceSegments.emplace(dev->EndAddress(), dev);
     dev->BindFastMem(fastmem);
     dev->UpdatePageTable(*pageTable);
+    RebuildDirectPages();
 }
 
 void Emulator::Lock()
@@ -158,6 +161,34 @@ void* Emulator::MemoryMap(u32 addr)
     } else {
         u32 offset = addr - dev->BaseAddress();
         return dev->Map(offset);
+    }
+}
+
+void Emulator::RebuildDirectPages()
+{
+    constexpr u32 kPageSize = 1u << PAGE_BITS;
+    constexpr u32 kMmrBase = 0xFFC00000;
+    std::fill(directPages.begin(), directPages.end(), nullptr);
+    for (Device* dev : devices) {
+        if (typeid(*dev) != typeid(MemoryDevice)) continue;
+        if ((dev->BaseAddress() | dev->Size()) & (kPageSize - 1)) continue;
+        for (u64 page = dev->BaseAddress(); page < u64(dev->EndAddress()) + 1 && page < kMmrBase;
+             page += kPageSize) {
+            const u32 first = u32(page), last = u32(page + kPageSize - 1);
+            // The device map must send every byte of the page to this device:
+            // get_device() picks the first segment end at or above an
+            // address, so the last byte must find this device and no other
+            // device may end or begin inside the page, as one nested in the
+            // RAM does.
+            if (get_device(last, deviceSegments) != dev) continue;
+            bool other = false;
+            for (auto it = deviceSegments.lower_bound(first); it != deviceSegments.end() && it->first <= last; ++it)
+                other |= it->second != dev;
+            if (other) continue;
+            if (readHooks.lower_bound(first) != readHooks.upper_bound(last)) continue;
+            if (writeHooks.lower_bound(first) != writeHooks.upper_bound(last)) continue;
+            directPages[page >> PAGE_BITS] = static_cast<u8*>(dev->Map(first - dev->BaseAddress()));
+        }
     }
 }
 

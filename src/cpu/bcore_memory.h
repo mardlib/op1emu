@@ -25,9 +25,21 @@ public:
     void write16(uint32_t addr, uint16_t val) override;
     void write32(uint32_t addr, uint32_t val) override;
 
+    // Records the fault in DCPLB_FAULT_STATUS/ADDR and ICPLB_FAULT_STATUS/ADDR for the guest's EVT3 handler.
+    void data_alignment_fault(uint32_t pc, uint32_t addr, uint32_t status) override;
     const uint8_t* raw() const override;
 
     uint32_t rawmem_limit() const override { return 0; }
+
+    // Emulator::DirectPages(), so generated code reaches RAM without calling
+    // back here; null while the memory census counts every access.
+    uint8_t* const* page_table() const override;
+
+    // Device callbacks, data_alignment_fault() and the Emulator's read and
+    // write hooks reach CEC state (cec_mmr_*, cec_raise) and peripheral state,
+    // never a guest register, so generated code may keep registers in host
+    // registers across an access that calls back here.
+    bool callbacks_preserve_registers() const override { return true; }
 
 #ifdef ENABLE_PROFILING
     // Counts guest accesses to the MMR space (0xFFC00000 and up). Not owned.
